@@ -13,8 +13,8 @@
         - в читаемый лог   log.txt
         - в историю        history.csv (открывается в Excel)
   4. Текущий снимок хранит в state.json
-  5. Строит текстовый отчёт report.txt: по каждой игре все проверки
-     от появления в линии до начала матча
+  5. Строит отчёты report.txt (🔴 = сдвиг форы) и report.html (сдвиг форы
+     выделен красной строкой) — по каждой игре от появления до начала матча
 
 Режимы:
   python3 marathon_fora_monitor.py --once                  одна проверка
@@ -268,12 +268,64 @@ def _report_pair(fora, price):
     return "{} ({})".format(fora or "—", price or "—")
 
 
-def build_line_report(csv_path, report_path, generated_at=None):
+def _write_line_report_html(blocks, html_path, generated_at):
+    """Пишет HTML-версию отчёта: строки со сдвигом форы выделены красным
+    целиком (открывается в любом браузере)."""
+    upd = (generated_at or datetime.now(MSK)).strftime("%d.%m.%Y %H:%M МСК")
+    out = [
+        "<!DOCTYPE html>",
+        '<html lang="ru">',
+        "<head>",
+        '<meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        "<title>Динамика форы NBA — Marathonbet</title>",
+        "<style>",
+        "body{font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif;"
+        "margin:14px;color:#1a1a1a;}",
+        "h1{font-size:18px;margin:0 0 4px;}",
+        ".meta{color:#666;font-size:13px;margin-bottom:8px;line-height:1.5;}",
+        ".legend{font-size:12.5px;color:#444;margin:10px 0 16px;}",
+        ".legend .sw{display:inline-block;width:12px;height:12px;"
+        "background:#fdecea;border:1px solid #d32f2f;vertical-align:-1px;"
+        "margin-right:6px;}",
+        ".match{margin-bottom:14px;}",
+        ".line{font-family:Consolas,'Courier New',monospace;font-size:13.5px;"
+        "padding:3px 8px;}",
+        ".changed{background:#fdecea;color:#b71c1c;font-weight:600;"
+        "border-left:3px solid #d32f2f;}",
+        "</style>",
+        "</head>",
+        "<body>",
+        "<h1>Динамика форы NBA — Marathonbet</h1>",
+        '<div class="meta">Время проверок московское. Обновлён: {}.<br>'
+        "По каждой игре: все проверки от появления в линии до начала матча.<br>"
+        "Формат: [фора 1 (кэф 1) / фора 2 (кэф 2)].</div>".format(upd),
+        '<div class="legend"><span class="sw"></span>красная строка — фора '
+        "изменилась по сравнению с предыдущей проверкой (движение кэфов "
+        "изменением не считается)</div>",
+    ]
+    for block in blocks:
+        out.append('<div class="match">')
+        for text, changed in block:
+            cls = "line changed" if changed else "line"
+            out.append('<div class="{}">{}</div>'.format(
+                cls, html.escape(text, quote=False)))
+        out.append("</div>")
+    out.extend(["</body>", "</html>"])
+    tmp = html_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    os.replace(tmp, html_path)
+
+
+def build_line_report(csv_path, report_path, html_path=None, generated_at=None):
     """Строит текстовый отчёт по истории проверок (history.csv).
 
     По каждой игре — все её проверки от первого появления в линии
     до начала матча, строка вида:
       05 ноя 03:00 | Вашингтон Уизардс - Атланта Хокс: [+4.5 (1.80) / -4.5 (2.00)]
+    Строки, где фора сдвинулась относительно предыдущей проверки, помечаются
+    🔴 (в txt) и выделяются красной строкой (в html, если задан html_path).
     Возвращает количество матчей, попавших в отчёт.
     """
     matches = {}
@@ -310,15 +362,7 @@ def build_line_report(csv_path, report_path, generated_at=None):
         start = m["start_dated"] or m["start_plain"]
         return (start or datetime.max, m["name"])
 
-    lines = [
-        "Динамика форы NBA — Marathonbet (время проверок московское)",
-        "По каждой игре: все проверки от появления в линии до начала матча.",
-        "Формат линии: [фора 1 (кэф 1) / фора 2 (кэф 2)].",
-        "Обновлён: {}".format(
-            (generated_at or datetime.now(MSK)).strftime("%d.%m.%Y %H:%M МСК")),
-        "",
-    ]
-
+    blocks = []  # блоки: список пар (строка, изменилась_ли_фора)
     for mid in sorted(matches, key=sort_key):
         m = matches[mid]
         start = m["start_dated"] or m["start_plain"]
@@ -327,11 +371,34 @@ def build_line_report(csv_path, report_path, generated_at=None):
             before = [r for r in rows if r[0] <= start]
             if before:  # проверки после начала матча не показываем
                 rows = before
+        block = []
+        prev_fora = None
         for chk, row in rows:
-            lines.append("{} | {}: [{} / {}]".format(
+            f1 = (row.get("фора 1") or "").strip()
+            f2 = (row.get("фора 2") or "").strip()
+            text = "{} | {}: [{} / {}]".format(
                 _fmt_check_dt(chk), m["name"],
-                _report_pair(row.get("фора 1"), row.get("кэф 1")),
-                _report_pair(row.get("фора 2"), row.get("кэф 2"))))
+                _report_pair(f1, row.get("кэф 1")),
+                _report_pair(f2, row.get("кэф 2")))
+            # сдвиг ФОРЫ относительно предыдущей проверки; кэфы не считаются
+            changed = prev_fora is not None and (f1, f2) != prev_fora
+            block.append((text, changed))
+            prev_fora = (f1, f2)
+        blocks.append(block)
+
+    lines = [
+        "Динамика форы NBA — Marathonbet (время проверок московское)",
+        "По каждой игре: все проверки от появления в линии до начала матча.",
+        "Формат линии: [фора 1 (кэф 1) / фора 2 (кэф 2)].",
+        "🔴 — фора изменилась относительно предыдущей проверки "
+        "(движение кэфов изменением не считается).",
+        "Обновлён: {}".format(
+            (generated_at or datetime.now(MSK)).strftime("%d.%m.%Y %H:%M МСК")),
+        "",
+    ]
+    for block in blocks:
+        for text, changed in block:
+            lines.append(("🔴 " + text) if changed else text)
         lines.append("")
 
     while lines and lines[-1] == "":
@@ -341,6 +408,9 @@ def build_line_report(csv_path, report_path, generated_at=None):
     with open(tmp, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     os.replace(tmp, report_path)
+
+    if html_path:
+        _write_line_report_html(blocks, html_path, generated_at)
     return len(matches)
 
 
@@ -451,11 +521,12 @@ def run_once(data_dir, url, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES, qu
     append_log(log_path, "\n".join(log_lines))
     save_state(state_path, prev_state)
 
-    # текстовый отчёт: динамика форы по каждой игре от появления до начала
+    # отчёты: динамика форы по каждой игре от появления до начала (txt + html)
     try:
-        build_line_report(csv_path, os.path.join(data_dir, "report.txt"))
+        build_line_report(csv_path, os.path.join(data_dir, "report.txt"),
+                          html_path=os.path.join(data_dir, "report.html"))
     except Exception as err:  # noqa: BLE001 - отчёт не должен ломать проверку
-        print("[!] не удалось построить report.txt: {}".format(err), file=sys.stderr)
+        print("[!] не удалось построить отчёты: {}".format(err), file=sys.stderr)
 
     summary = ("Проверка {} МСК: матчей {}, новых {}, изменений {}, "
                "без изменений {} (без линии {}).".format(
