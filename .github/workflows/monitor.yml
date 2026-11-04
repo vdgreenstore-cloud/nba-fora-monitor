@@ -1,0 +1,50 @@
+name: Мониторинг фор NBA
+
+# Запуск: каждые 30 минут (GitHub считает время в UTC; мск = UTC+3,
+# поэтому :00 и :30 совпадают с московскими) + кнопка ручного запуска.
+on:
+  schedule:
+    - cron: '0,30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Не позволяем двум проверкам выполняться одновременно
+concurrency:
+  group: fora-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Скачать репозиторий
+        uses: actions/checkout@v4
+
+      - name: Установить Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Проверка линий
+        id: run
+        run: |
+          python3 marathon_fora_monitor.py --once --data-dir data || echo "failed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Сохранить результаты в репозиторий
+        run: |
+          git config user.name "fora-monitor-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          if git diff --cached --quiet; then
+            echo "Изменений для коммита нет"
+          else
+            git commit -m "проверка $(TZ=Europe/Moscow date +'%d.%m.%Y %H:%M') мск"
+            git push
+          fi
+
+      - name: Пометить ошибку проверки
+        if: steps.run.outputs.failed == 'true'
+        run: exit 1
