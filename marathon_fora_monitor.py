@@ -7,7 +7,9 @@
   1. Скачивает страницу https://www.marathonbet.ru/su/betting/Basketball/NBA
   2. По каждой игре извлекает главную фору и коэффициенты на неё
   3. Сравнивает с предыдущим запуском и построчно записывает по каждой игре,
-     изменилась линия или нет:
+     изменилась линия или нет. Изменением считается только сдвиг ФОРЫ;
+     коэффициенты записываются в историю, но их движение не считается
+     изменением:
         - в читаемый лог   log.txt
         - в историю        history.csv (открывается в Excel)
   4. Текущий снимок хранит в state.json
@@ -226,20 +228,18 @@ def fmt_fora(ev):
 
 
 def fmt_changes(prev, ev):
-    """Перечисляет, что именно изменилось по сравнению с прошлым снимком."""
+    """Перечисляет сдвиги ФОРЫ по сравнению с прошлым снимком (кэфы не считаем)."""
     labels = [
-        ("фора 1", 0, 1, lambda v: v if v is not None else "—"),
-        ("кэф 1", 1, 0, lambda v: v if v is not None else "—"),
-        ("фора 2", 2, 3, lambda v: v if v is not None else "—"),
-        ("кэф 2", 3, 0, lambda v: v if v is not None else "—"),
+        ("фора 1", 0),
+        ("фора 2", 2),
     ]
     diffs = []
-    for label, cur_idx, _, fmt in labels:
-        cur_val = snapshot_tuple(ev)[cur_idx]
-        old_val = prev[cur_idx]
+    for label, idx in labels:
+        cur_val = snapshot_tuple(ev)[idx]
+        old_val = prev[idx]
         if cur_val != old_val:
-            diffs.append("{}: {} → {}".format(label, fmt(old_val) if old_val else "—",
-                                              fmt(cur_val)))
+            diffs.append("{}: {} → {}".format(label, old_val if old_val else "—",
+                                              cur_val if cur_val else "—"))
     return "; ".join(diffs)
 
 
@@ -271,23 +271,26 @@ def run_once(data_dir, url, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES, qu
 
     log_lines = ["=== {} МСК | матчей на странице: {} ===".format(ts, len(events))]
     for ev in events:
-        cur = snapshot_tuple(ev)
+        cur = snapshot_tuple(ev)  # полное состояние: [фора1, кэф1, фора2, кэф2]
         prev = prev_state.get(ev["id"])
+        # сравниваем ТОЛЬКО форы (индексы 0 и 2); кэфы не считаются изменением
+        same_fora = (isinstance(prev, list) and len(prev) >= 3
+                     and (ev["f1"], ev["f2"]) == (prev[0], prev[2]))
 
         if prev is None:
             status = "НОВЫЙ МАТЧ"
             stats["new"] += 1
             detail = fmt_fora(ev)
-        elif cur == tuple(prev):
+        elif same_fora:
             status = "БЕЗ ИЗМЕНЕНИЙ"
             stats["same"] += 1
             detail = fmt_fora(ev)
         else:
             status = "ИЗМЕНЕНИЕ"
             stats["changed"] += 1
-            detail = "было [{} ({}) / {} ({})] → стало [{} ({}) / {} ({})]; ".format(
-                prev[0] or "—", prev[1] or "—", prev[2] or "—", prev[3] or "—",
-                ev["f1"] or "—", ev["k1"] or "—", ev["f2"] or "—", ev["k2"] or "—")
+            detail = "было [{}/{}] → стало [{}/{}]; ".format(
+                prev[0] or "—", prev[2] or "—",
+                ev["f1"] or "—", ev["f2"] or "—")
             detail += fmt_changes(prev, ev)
         if ev["f1"] is None and ev["f2"] is None:
             stats["noline"] += 1
