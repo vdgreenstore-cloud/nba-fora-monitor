@@ -13,6 +13,8 @@
         - в читаемый лог   log.txt
         - в историю        history.csv (открывается в Excel)
   4. Текущий снимок хранит в state.json
+  5. Строит текстовый отчёт report.txt: по каждой игре все проверки
+     от появления в линии до начала матча
 
 Режимы:
   python3 marathon_fora_monitor.py --once                  одна проверка
@@ -204,6 +206,145 @@ def append_log(path, text):
 
 
 # ----------------------------------------------------------------------------
+# Текстовый отчёт: динамика форы по каждой игре (report.txt)
+# ----------------------------------------------------------------------------
+
+MONTHS_RU = ["янв", "фев", "мар", "апр", "мая", "июн",
+             "июл", "авг", "сен", "окт", "ноя", "дек"]
+
+
+def _parse_check_dt(value):
+    """'04.11.2026 23:57:35' -> datetime."""
+    return datetime.strptime(value.strip(), "%d.%m.%Y %H:%M:%S")
+
+
+def _fmt_check_dt(dt):
+    """datetime -> '05 ноя 03:00'."""
+    return "{:02d} {} {:02d}:{:02d}".format(
+        dt.day, MONTHS_RU[dt.month - 1], dt.hour, dt.minute)
+
+
+def _normalize_start(raw, check_dt):
+    """Приводит время начала матча к datetime.
+
+    На сайте два варианта: '05 ноя 03:00' (с датой) и просто '03:00'
+    (когда матч в день проверки). Во втором случае дата берётся от даты
+    проверки; если такое время раньше самой проверки — матч на следующий день.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    m = re.match(r"^(\d{1,2})\s+([а-яё]+)\.?\s+(\d{1,2}):(\d{2})$",
+                 raw, re.IGNORECASE)
+    if m:
+        mon_name = m.group(2).lower()[:3]
+        if mon_name not in MONTHS_RU:
+            return None
+        month = MONTHS_RU.index(mon_name) + 1
+        year = check_dt.year
+        if month == 1 and check_dt.month == 12:  # переход через новый год
+            year += 1
+        try:
+            return datetime(year, month, int(m.group(1)),
+                            int(m.group(3)), int(m.group(4)))
+        except ValueError:
+            return None
+    m = re.match(r"^(\d{1,2}):(\d{2})$", raw)
+    if m:
+        start = check_dt.replace(hour=int(m.group(1)), minute=int(m.group(2)),
+                                 second=0, microsecond=0)
+        if start < check_dt - timedelta(minutes=5):
+            start += timedelta(days=1)
+        return start
+    return None
+
+
+def _report_pair(fora, price):
+    """'фора (кэф)' с аккуратной заменой пустых значений на '—'."""
+    fora = (fora or "").strip()
+    price = (price or "").strip()
+    if not fora and not price:
+        return "—"
+    return "{} ({})".format(fora or "—", price or "—")
+
+
+def build_line_report(csv_path, report_path, generated_at=None):
+    """Строит текстовый отчёт по истории проверок (history.csv).
+
+    По каждой игре — все её проверки от первого появления в линии
+    до начала матча, строка вида:
+      05 ноя 03:00 | Вашингтон Уизардс - Атланта Хокс: [+4.5 (1.80) / -4.5 (2.00)]
+    Возвращает количество матчей, попавших в отчёт.
+    """
+    matches = {}
+    with open(csv_path, encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f, delimiter=";"):
+            try:
+                chk = _parse_check_dt(row.get("время проверки") or "")
+            except ValueError:
+                continue
+            mid = (row.get("id матча") or row.get("матч") or "").strip()
+            m = matches.setdefault(mid, {
+                "name": (row.get("матч") or "").strip(),
+                "start_dated": None,   # начало из записи с датой '05 ноя 03:00'
+                "start_plain": None,   # начало из записи только со временем
+                "first_check": chk,
+                "rows": [],
+            })
+            m["rows"].append((chk, row))
+            if chk < m["first_check"]:
+                m["first_check"] = chk
+
+            raw_start = (row.get("начало (МСК)") or "").strip()
+            norm = _normalize_start(raw_start, chk)
+            if norm is None:
+                continue
+            if re.search(r"[а-яё]", raw_start, re.IGNORECASE):
+                if m["start_dated"] is None or norm < m["start_dated"]:
+                    m["start_dated"] = norm
+            elif m["start_plain"] is None or norm < m["start_plain"]:
+                m["start_plain"] = norm
+
+    def sort_key(mid):
+        m = matches[mid]
+        start = m["start_dated"] or m["start_plain"]
+        return (start or datetime.max, m["name"])
+
+    lines = [
+        "Динамика форы NBA — Marathonbet (время проверок московское)",
+        "По каждой игре: все проверки от появления в линии до начала матча.",
+        "Формат линии: [фора 1 (кэф 1) / фора 2 (кэф 2)].",
+        "Обновлён: {}".format(
+            (generated_at or datetime.now(MSK)).strftime("%d.%m.%Y %H:%M МСК")),
+        "",
+    ]
+
+    for mid in sorted(matches, key=sort_key):
+        m = matches[mid]
+        start = m["start_dated"] or m["start_plain"]
+        rows = sorted(m["rows"], key=lambda x: x[0])
+        if start is not None:
+            before = [r for r in rows if r[0] <= start]
+            if before:  # проверки после начала матча не показываем
+                rows = before
+        for chk, row in rows:
+            lines.append("{} | {}: [{} / {}]".format(
+                _fmt_check_dt(chk), m["name"],
+                _report_pair(row.get("фора 1"), row.get("кэф 1")),
+                _report_pair(row.get("фора 2"), row.get("кэф 2"))))
+        lines.append("")
+
+    while lines and lines[-1] == "":
+        lines.pop()
+
+    tmp = report_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, report_path)
+    return len(matches)
+
+
+# ----------------------------------------------------------------------------
 # Один цикл проверки
 # ----------------------------------------------------------------------------
 
@@ -309,6 +450,12 @@ def run_once(data_dir, url, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES, qu
 
     append_log(log_path, "\n".join(log_lines))
     save_state(state_path, prev_state)
+
+    # текстовый отчёт: динамика форы по каждой игре от появления до начала
+    try:
+        build_line_report(csv_path, os.path.join(data_dir, "report.txt"))
+    except Exception as err:  # noqa: BLE001 - отчёт не должен ломать проверку
+        print("[!] не удалось построить report.txt: {}".format(err), file=sys.stderr)
 
     summary = ("Проверка {} МСК: матчей {}, новых {}, изменений {}, "
                "без изменений {} (без линии {}).".format(
