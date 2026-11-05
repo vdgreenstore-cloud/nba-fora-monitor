@@ -371,6 +371,55 @@ def _report_pair(fora, price):
     return "{} ({})".format(fora or "—", price or "—")
 
 
+# ----------------------------------------------------------------------------
+# Оформление .txt-отчётов: разделители, шапки, колонки
+# ----------------------------------------------------------------------------
+
+RULE_WIDTH = 68      # ширина разделителей в .txt-отчётах
+MARK_SHIFT = "🔴  "   # сдвиг форы: эмодзи (≈2 колонки) + 2 пробела = 4 колонки
+MARK_PLAIN = "    "   # обычная строка: те же 4 колонки пробелами
+MARK_SCORE = "✅  "   # итоговый счёт завершившегося матча
+
+
+def _rule(char="─"):
+    """Горизонтальный разделитель .txt-отчёта."""
+    return char * RULE_WIDTH
+
+
+def _display_name(match_name):
+    """Заголовок матча: 'Вашингтон Уизардс - Атланта Хокс' ->
+    'ВАШИНГТОН УИЗАРДС – АТЛАНТА ХОКС' (для шапок блоков в отчётах)."""
+    return (match_name or "").replace(" - ", " – ").upper()
+
+
+def _line_body(line):
+    """Линия проверки: '[фора 1 (кэф 1) / фора 2 (кэф 2)]'."""
+    return "[{} / {}]".format(_report_pair(line["f1"], line["p1"]),
+                              _report_pair(line["f2"], line["p2"]))
+
+
+def _txt_line(line):
+    """Строка проверки для .txt: '🔴  05 ноя 01:44   [+1.5 (1.83) / -1.5 (1.98)]'.
+
+    Пометка 🔴 ставится в левом поле (эмодзи + 2 пробела ≈ те же 4 колонки,
+    что и в обычной строке), поэтому времена всех строк выровнены."""
+    prefix = MARK_SHIFT if line["changed"] else MARK_PLAIN
+    return "{}{}   {}".format(prefix, _fmt_check_dt(line["chk"]),
+                              _line_body(line))
+
+
+def _match_head_txt(num, block):
+    """Шапка блока матча для .txt-отчётов (время начала — московское)."""
+    start_txt = (_fmt_check_dt(block["start"].replace(second=0, microsecond=0))
+                 if block["start"] else "—")
+    return [
+        _rule(),
+        "{}. {}".format(num, _display_name(block["name"])),
+        "   начало {} · проверок: {} · сдвигов форы: {}".format(
+            start_txt, len(block["lines"]), block["shifts"]),
+    ]
+
+
 _HTML_STYLE = (
     "<style>"
     "body{font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif;"
@@ -455,7 +504,8 @@ def _match_blocks(matches):
 
     Возвращает список словарей:
       {"name": str, "start": datetime|None,
-       "lines": [(текст_строки, сдвиг_форы: bool)], "shifts": int}
+       "lines": [словарь проверки: chk, f1, p1, f2, p2, changed],
+       "shifts": int}
     Сдвигом считается изменение форы относительно ПРЕДЫДУЩЕЙ проверки
     (движение кэфов изменением не считается). Проверки после начала
     матча не включаются.
@@ -479,12 +529,12 @@ def _match_blocks(matches):
         for chk, row in rows:
             f1 = (row.get("фора 1") or "").strip()
             f2 = (row.get("фора 2") or "").strip()
-            text = "{} | {}: [{} / {}]".format(
-                _fmt_check_dt(chk), m["name"],
-                _report_pair(f1, row.get("кэф 1")),
-                _report_pair(f2, row.get("кэф 2")))
-            changed = prev_fora is not None and (f1, f2) != prev_fora
-            lines.append((text, changed))
+            lines.append({
+                "chk": chk,
+                "f1": f1, "p1": (row.get("кэф 1") or "").strip(),
+                "f2": f2, "p2": (row.get("кэф 2") or "").strip(),
+                "changed": prev_fora is not None and (f1, f2) != prev_fora,
+            })
             prev_fora = (f1, f2)
         blocks.append({
             "mid": mid,
@@ -492,7 +542,7 @@ def _match_blocks(matches):
             "start": start,
             "first": m["first_check"],
             "lines": lines,
-            "shifts": sum(1 for _, c in lines if c),
+            "shifts": sum(1 for l in lines if l["changed"]),
         })
     return blocks
 
@@ -509,12 +559,20 @@ def _write_line_report_html(blocks, html_path, generated_at):
         "изменилась по сравнению с предыдущей проверкой (движение кэфов "
         "изменением не считается)</div>",
     ]
-    for block in blocks:
+    for i, block in enumerate(blocks, 1):
+        start_txt = (_fmt_check_dt(block["start"].replace(second=0, microsecond=0))
+                     if block["start"] else "—")
         body.append('<div class="match">')
-        for text, changed in block["lines"]:
-            cls = "line changed" if changed else "line"
+        body.append('<div class="game-head">{}</div>'.format(html.escape(
+            "{}. {} · начало {} · проверок: {} · сдвигов форы: {}".format(
+                i, _display_name(block["name"]), start_txt,
+                len(block["lines"]), block["shifts"]), quote=False)))
+        for line in block["lines"]:
+            cls = "line changed" if line["changed"] else "line"
             body.append('<div class="{}">{}</div>'.format(
-                cls, html.escape(text, quote=False)))
+                cls, html.escape("{}   {}".format(
+                    _fmt_check_dt(line["chk"]), _line_body(line)),
+                    quote=False)))
         body.append("</div>")
     _write_html(html_path, "Динамика форы NBA — Marathonbet", body)
 
@@ -523,31 +581,26 @@ def build_line_report(csv_path, report_path, html_path=None, generated_at=None):
     """Строит текстовый отчёт по истории проверок (history.csv).
 
     По каждой игре — все её проверки от первого появления в линии
-    до начала матча, строка вида:
-      05 ноя 03:00 | Вашингтон Уизардс - Атланта Хокс: [+4.5 (1.80) / -4.5 (2.00)]
-    Строки, где фора сдвинулась относительно предыдущей проверки, помечаются
-    🔴 (в txt) и выделяются красной строкой (в html, если задан html_path).
-    Возвращает количество матчей, попавших в отчёт.
+    до начала матча. Строки, где фора сдвинулась относительно предыдущей
+    проверки, помечаются 🔴 (в txt) и выделяются красной строкой (в html,
+    если задан html_path). Возвращает количество матчей, попавших в отчёт.
     """
     blocks = _match_blocks(_load_history_matches(csv_path))
+    upd = (generated_at or datetime.now(MSK)).strftime("%d.%m.%Y %H:%M МСК")
 
     lines = [
-        "Динамика форы NBA — Marathonbet (время проверок московское)",
-        "По каждой игре: все проверки от появления в линии до начала матча.",
-        "Формат линии: [фора 1 (кэф 1) / фора 2 (кэф 2)].",
-        "🔴 — фора изменилась относительно предыдущей проверки "
-        "(движение кэфов изменением не считается).",
-        "Обновлён: {}".format(
-            (generated_at or datetime.now(MSK)).strftime("%d.%m.%Y %H:%M МСК")),
-        "",
+        _rule("━"),
+        "  NBA · ДИНАМИКА ФОРЫ — MARATHONBET",
+        "  Обновлён: {} · время проверок московское".format(upd),
+        _rule("━"),
+        "  По каждой игре: все проверки от появления в линии до начала матча.",
+        "  Формат линии: [фора 1 (кэф 1) / фора 2 (кэф 2)].",
+        "  🔴 — фора сдвинулась относительно предыдущей проверки",
+        "     (движение кэфов изменением не считается).",
     ]
-    for block in blocks:
-        for text, changed in block["lines"]:
-            lines.append(("🔴 " + text) if changed else text)
-        lines.append("")
-
-    while lines and lines[-1] == "":
-        lines.pop()
+    for i, block in enumerate(blocks, 1):
+        lines.extend(_match_head_txt(i, block))
+        lines.extend(_txt_line(l) for l in block["lines"])
 
     tmp = report_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -733,7 +786,7 @@ def build_changes_archive(csv_path, out_dir, generated_at=None, results_path=Non
     for day in sorted(days):
         day_blocks = days[day]
         txt_path = os.path.join(out_dir, day.strftime("%Y-%m-%d") + ".txt")
-        _write_day_txt(day, day_blocks, txt_path, results)
+        _write_day_txt(day, day_blocks, txt_path, results, generated_at)
         written.append(txt_path)
     # убираем .html прошлых версий — в архиве теперь только .txt
     for fn in os.listdir(out_dir):
@@ -745,17 +798,35 @@ def build_changes_archive(csv_path, out_dir, generated_at=None, results_path=Non
     return written
 
 
-def _day_head_lines(day, day_blocks):
-    """Шапка дневного файла архива (для txt)."""
+def _day_head_txt(day, day_blocks, generated_at=None, all_games=False):
+    """Шапка дневного файла (общая для архива изменений и полных отчётов)."""
     total_shifts = sum(b["shifts"] for b in day_blocks)
+    with_shifts = sum(1 for b in day_blocks if b["shifts"])
+    upd = (generated_at or datetime.now(MSK)).strftime("%d.%m.%Y %H:%M МСК")
+    title = "ИГРОВОЙ ДЕНЬ {} (МСК) — {}".format(
+        day.strftime("%d.%m.%Y"),
+        "ВСЕ ИГРЫ ДНЯ" if all_games else "ИГРЫ СО СДВИГАМИ ФОРЫ")
+    if all_games:
+        stats = "Игр: {} · со сдвигами форы: {} · сдвигов: {}".format(
+            len(day_blocks), with_shifts, total_shifts)
+        notes = [
+            "  По каждой игре: все проверки от появления в линии до закрытия",
+            "  (последняя проверка перед началом матча).",
+            "  Формат линии: [фора 1 (кэф 1) / фора 2 (кэф 2)] · 🔴 — сдвиг форы.",
+        ]
+    else:
+        stats = "Игр со сдвигами: {} · сдвигов форы: {}".format(
+            len(day_blocks), total_shifts)
+        notes = [
+            "  По каждой игре: все проверки от появления в линии до начала матча.",
+            "  🔴 — сдвиг форы · ✅ — итоговый счёт завершившегося матча.",
+        ]
     return [
-        "ИГРОВОЙ ДЕНЬ {} (МСК) — игры со сдвигами форы".format(
-            day.strftime("%d.%m.%Y")),
-        "Мониторинг линии: от появления игры до её начала; "
-        "движение кэфов изменением не считается.",
-        "Игр со сдвигами: {} | Сдвигов форы: {}".format(
-            len(day_blocks), total_shifts),
-    ]
+        _rule("━"),
+        "  " + title,
+        "  {} · обновлён: {}".format(stats, upd),
+        _rule("━"),
+    ] + notes
 
 
 def _final_lines(block, results):
@@ -768,26 +839,19 @@ def _final_lines(block, results):
     score = rec.get("score")
     if not score:
         return []
-    line = "Итоговый счёт: {}".format(score)
+    line = MARK_SCORE + "Итоговый счёт: {}".format(score)
     if rec.get("ot"):
         line += " (овертайм)"
     return [line]
 
 
-def _write_day_txt(day, day_blocks, txt_path, results=None):
-    lines = _day_head_lines(day, day_blocks)
-    lines.append("")
-    for block in day_blocks:
-        start_txt = (_fmt_check_dt(block["start"].replace(second=0, microsecond=0))
-                     if block["start"] else "—")
-        lines.append("=== {} | начало {} | сдвигов форы: {} ===".format(
-            block["name"], start_txt, block["shifts"]))
-        for text, changed in block["lines"]:
-            lines.append(("🔴 " + text) if changed else text)
+def _write_day_txt(day, day_blocks, txt_path, results=None, generated_at=None):
+    """Файл архива изменений за игровой день (только .txt)."""
+    lines = _day_head_txt(day, day_blocks, generated_at, all_games=False)
+    for i, block in enumerate(day_blocks, 1):
+        lines.extend(_match_head_txt(i, block))
+        lines.extend(_txt_line(l) for l in block["lines"])
         lines.extend(_final_lines(block, results))
-        lines.append("")
-    while lines and lines[-1] == "":
-        lines.pop()
     tmp = txt_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -838,29 +902,11 @@ def build_day_reports(csv_path, out_dir, generated_at=None):
 
 
 def _write_gameday_txt(day, day_blocks, txt_path, generated_at=None):
-    lines = [
-        "ИГРОВОЙ ДЕНЬ {} (МСК) — все игры дня".format(day.strftime("%d.%m.%Y")),
-        "По каждой игре: все проверки от появления в линии до закрытия "
-        "(последняя проверка перед началом матча).",
-        "Формат линии: [фора 1 (кэф 1) / фора 2 (кэф 2)].",
-        "🔴 — фора изменилась относительно предыдущей проверки "
-        "(движение кэфов изменением не считается).",
-        "Обновлён: {}".format(
-            (generated_at or datetime.now(MSK)).strftime("%d.%m.%Y %H:%M МСК")),
-        "Игр: {} | из них со сдвигами форы: {}".format(
-            len(day_blocks), sum(1 for b in day_blocks if b["shifts"])),
-        "",
-    ]
-    for block in day_blocks:
-        start_txt = (_fmt_check_dt(block["start"].replace(second=0, microsecond=0))
-                     if block["start"] else "—")
-        lines.append("=== {} | начало {} | сдвигов форы: {} ===".format(
-            block["name"], start_txt, block["shifts"]))
-        for text, changed in block["lines"]:
-            lines.append(("🔴 " + text) if changed else text)
-        lines.append("")
-    while lines and lines[-1] == "":
-        lines.pop()
+    """Файл полного отчёта за игровой день (все игры) — только .txt."""
+    lines = _day_head_txt(day, day_blocks, generated_at, all_games=True)
+    for i, block in enumerate(day_blocks, 1):
+        lines.extend(_match_head_txt(i, block))
+        lines.extend(_txt_line(l) for l in block["lines"])
     tmp = txt_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
