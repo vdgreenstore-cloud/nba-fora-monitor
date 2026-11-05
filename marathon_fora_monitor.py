@@ -20,6 +20,9 @@
      матча в конце его блока появляется итоговый счёт (с пометкой об овертайме)
   7. Ведёт полные отчёты по игровым дням: data/report/Д.М.txt (5.11.txt, 6.11.txt…)
      — все игры дня от появления в линии до закрытия линии (начала матча)
+  8. Схлопывает длинные периоды без изменений: если фора не менялась 2 часа
+     и дольше, промежуточные проверки «без изменений» убираются — остаётся
+     последнее изменение и строка «··· далее N проверок без изменений…»
 
 Режимы:
   python3 marathon_fora_monitor.py --once                  одна проверка
@@ -379,6 +382,10 @@ RULE_WIDTH = 68      # ширина разделителей в .txt-отчёт�
 MARK_SHIFT = "🔴  "   # сдвиг форы: эмодзи (≈2 колонки) + 2 пробела = 4 колонки
 MARK_PLAIN = "    "   # обычная строка: те же 4 колонки пробелами
 MARK_SCORE = "✅  "   # итоговый счёт завершившегося матча
+# Схлопывание «пустых» серий: если фора не менялась дольше этого срока,
+# промежуточные проверки «без изменений» убираются из отчётов
+# (остаётся последнее изменение и строка «··· далее N проверок …»)
+STABLE_COMPRESS_AFTER = timedelta(hours=2)
 
 
 def _rule(char="─"):
@@ -406,6 +413,61 @@ def _txt_line(line):
     prefix = MARK_SHIFT if line["changed"] else MARK_PLAIN
     return "{}{}   {}".format(prefix, _fmt_check_dt(line["chk"]),
                               _line_body(line))
+
+
+def _checks_plural(n):
+    """'5 проверок' / '3 проверки' / '1 проверка' для строк-многоточий."""
+    if n % 10 == 1 and n % 100 != 11:
+        return "{} проверка".format(n)
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return "{} проверки".format(n)
+    return "{} проверок".format(n)
+
+
+def _compress_lines(lines):
+    """Схлопывает длинные серии проверок «без изменений форы».
+
+    Серия — подряд идущие проверки, в которых фора та же, что и в предыдущей.
+    Если в серии 2+ проверки и с якорной строки (последний сдвиг форы или
+    первая проверка матча) до последней проверки серии прошло 2 часа и больше
+    (STABLE_COMPRESS_AFTER), серия заменяется ОДНОЙ строкой-многоточием
+    {"ellipsis": "далее N проверок без изменений (последняя …)"} — само
+    последнее изменение (🔴) и первая проверка матча всегда остаются.
+    Серии короче 2 часов показываются целиком. Возвращает НОВЫЙ список.
+    """
+    if len(lines) <= 1:
+        return list(lines)
+    out = [lines[0]]  # первая проверка (появление в линии) — всегда
+    i, n = 1, len(lines)
+    while i < n:
+        if lines[i]["changed"]:
+            out.append(lines[i])
+            i += 1
+            continue
+        j = i
+        while j < n and not lines[j]["changed"]:
+            j += 1
+        run = lines[i:j]  # максимальная серия подряд «без изменений»
+        anchor = out[-1]["chk"]  # последний сдвиг или первая проверка
+        if (len(run) >= 2
+                and run[-1]["chk"] - anchor >= STABLE_COMPRESS_AFTER):
+            out.append({"ellipsis": "далее {} без изменений (последняя {})".format(
+                _checks_plural(len(run)), _fmt_check_dt(run[-1]["chk"]))})
+        else:
+            out.extend(run)
+        i = j
+    return out
+
+
+def _txt_block_lines(lines):
+    """Строки блока матча для .txt: со схлопыванием длинных серий."""
+    out = []
+    for l in _compress_lines(lines):
+        if "ellipsis" in l:
+            out.append("    ··· " + l["ellipsis"] + " ···")
+        else:
+            out.append(_txt_line(l))
+    return out
 
 
 def _match_head_txt(num, block):
@@ -439,6 +501,7 @@ _HTML_STYLE = (
     ".final{font-family:Consolas,'Courier New',monospace;font-size:13.5px;"
     "padding:3px 8px;color:#1b5e20;font-weight:600;"
     "border-left:3px solid #2e7d32;margin-top:2px;}"
+    ".hidden{color:#8a8a8a;font-size:12.5px;font-style:italic;padding:2px 8px;}"
     "</style>"
 )
 
@@ -567,7 +630,11 @@ def _write_line_report_html(blocks, html_path, generated_at):
             "{}. {} · начало {} · проверок: {} · сдвигов форы: {}".format(
                 i, _display_name(block["name"]), start_txt,
                 len(block["lines"]), block["shifts"]), quote=False)))
-        for line in block["lines"]:
+        for line in _compress_lines(block["lines"]):
+            if "ellipsis" in line:
+                body.append('<div class="hidden">··· {} ···</div>'.format(
+                    html.escape(line["ellipsis"], quote=False)))
+                continue
             cls = "line changed" if line["changed"] else "line"
             body.append('<div class="{}">{}</div>'.format(
                 cls, html.escape("{}   {}".format(
@@ -600,7 +667,7 @@ def build_line_report(csv_path, report_path, html_path=None, generated_at=None):
     ]
     for i, block in enumerate(blocks, 1):
         lines.extend(_match_head_txt(i, block))
-        lines.extend(_txt_line(l) for l in block["lines"])
+        lines.extend(_txt_block_lines(block["lines"]))
 
     tmp = report_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -850,7 +917,7 @@ def _write_day_txt(day, day_blocks, txt_path, results=None, generated_at=None):
     lines = _day_head_txt(day, day_blocks, generated_at, all_games=False)
     for i, block in enumerate(day_blocks, 1):
         lines.extend(_match_head_txt(i, block))
-        lines.extend(_txt_line(l) for l in block["lines"])
+        lines.extend(_txt_block_lines(block["lines"]))
         lines.extend(_final_lines(block, results))
     tmp = txt_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -906,7 +973,7 @@ def _write_gameday_txt(day, day_blocks, txt_path, generated_at=None):
     lines = _day_head_txt(day, day_blocks, generated_at, all_games=True)
     for i, block in enumerate(day_blocks, 1):
         lines.extend(_match_head_txt(i, block))
-        lines.extend(_txt_line(l) for l in block["lines"])
+        lines.extend(_txt_block_lines(block["lines"]))
     tmp = txt_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
