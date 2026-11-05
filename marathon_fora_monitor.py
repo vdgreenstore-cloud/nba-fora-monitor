@@ -15,7 +15,7 @@
   4. Текущий снимок хранит в state.json
   5. Строит отчёты report.txt (🔴 = сдвиг форы) и report.html (сдвиг форы
      выделен красной строкой) — по каждой игре от появления до начала матча
-  6. Ведёт архив изменений по игровым дням: data/изменения/ГГГГ-ММ-ДД.txt|.html —
+  6. Ведёт архив изменений по игровым дням: data/изменения/ГГГГ-ММ-ДД.txt —
      только игры со сдвигами форы за каждый игровой день; после завершения
      матча в конце его блока появляется итоговый счёт (с пометкой об овертайме)
   7. Ведёт полные отчёты по игровым дням: data/report/Д.М.txt (5.11.txt, 6.11.txt…)
@@ -58,7 +58,7 @@ GAME_OVER_AFTER = timedelta(hours=2, minutes=40)
 # сколько раз можно пытаться найти счёт матча, прежде чем перестать
 SCORE_MAX_TRIES = 8
 
-# русские названия команд у Marathonbet -> аббревиатуры ESPN
+# русские названия команд у Marathonbet -> каноничные аббревиатуры
 TEAM_ABBR = {
     "Атланта Хокс": "ATL",
     "Бостон Селтикс": "BOS",
@@ -90,6 +90,20 @@ TEAM_ABBR = {
     "Торонто Рэпторс": "TOR",
     "Юта Джаз": "UTA",
     "Вашингтон Уизардс": "WAS",
+}
+
+# разные варианты аббревиатур в фидах ESPN -> каноничные (как в TEAM_ABBR)
+ESPN_ABBR_ALIAS = {
+    "WAS": "WAS", "WSH": "WAS",
+    "GSW": "GSW", "GS": "GSW", "GG": "GSW",
+    "NOP": "NOP", "NO": "NOP", "NOR": "NOP",
+    "SAS": "SAS", "SA": "SAS",
+    "UTA": "UTA", "UTAH": "UTA",
+    "NYK": "NY", "NY": "NY",
+    "PHO": "PHX", "PHX": "PHX",
+    "CHO": "CHA", "CHA": "CHA",
+    "BKN": "BKN", "BRK": "BKN",
+    "SAN": "SAS",
 }
 
 CSV_COLUMNS = [
@@ -566,7 +580,8 @@ def _fetch_espn_scoreboard(date, timeout=DEFAULT_TIMEOUT):
                 continue
             abbrs, scores = set(), {}
             for c in comp["competitors"]:
-                abbr = (c.get("team") or {}).get("abbreviation", "").upper()
+                raw = (c.get("team") or {}).get("abbreviation", "").upper()
+                abbr = ESPN_ABBR_ALIAS.get(raw, raw)
                 abbrs.add(abbr)
                 try:
                     scores[abbr] = int(c.get("score"))
@@ -593,7 +608,8 @@ def fetch_final_scores(csv_path, results_path, timeout=DEFAULT_TIMEOUT):
     """
     matches = _load_history_matches(csv_path)
     results = _load_results(results_path)
-    now = datetime.now(MSK)
+    # история хранит наивное московское время — сравним с наивным "сейчас" МСК
+    now = datetime.now(MSK).replace(tzinfo=None)
 
     pending = []  # (id, матч, начало)
     for mid, m in matches.items():
@@ -651,15 +667,15 @@ def fetch_final_scores(csv_path, results_path, timeout=DEFAULT_TIMEOUT):
 
 
 def build_changes_archive(csv_path, out_dir, generated_at=None, results_path=None):
-    """Архив изменений по игровым дням.
+    """Архив изменений по игровым дням (только .txt, без .html).
 
     Для каждого игрового дня (дата начала матчей по МСК), в котором хотя бы
-    у одной игры сдвинулась фора, создаёт в папке out_dir пару файлов:
-      ГГГГ-ММ-ДД.txt и ГГГГ-ММ-ДД.html
+    у одной игры сдвинулась фора, создаёт в папке out_dir файл ГГГГ-ММ-ДД.txt.
     Внутри — только игры со сдвигами, все их проверки от появления в линии
-    до начала матча; строки со сдвигом помечены 🔴 / красным; после завершения
+    до начала матча; строки со сдвигом помечены 🔴; после завершения
     матча в конце его блока добавляется строка «Итоговый счёт: X:Y»
     (с пометкой об овертайме, если он был) из кэша results.json.
+    Старые .html из папки удаляются (версии до 06.11.2026 создавали их).
     Возвращает список созданных файлов.
     """
     blocks = _match_blocks(_load_history_matches(csv_path))
@@ -675,12 +691,16 @@ def build_changes_archive(csv_path, out_dir, generated_at=None, results_path=Non
     written = []
     for day in sorted(days):
         day_blocks = days[day]
-        stem = day.strftime("%Y-%m-%d")
-        txt_path = os.path.join(out_dir, stem + ".txt")
-        html_path = os.path.join(out_dir, stem + ".html")
+        txt_path = os.path.join(out_dir, day.strftime("%Y-%m-%d") + ".txt")
         _write_day_txt(day, day_blocks, txt_path, results)
-        _write_day_html(day, day_blocks, html_path, results)
-        written.extend([txt_path, html_path])
+        written.append(txt_path)
+    # убираем .html прошлых версий — в архиве теперь только .txt
+    for fn in os.listdir(out_dir):
+        if fn.endswith(".html"):
+            try:
+                os.remove(os.path.join(out_dir, fn))
+            except OSError:
+                pass
     return written
 
 
@@ -807,33 +827,9 @@ def _write_gameday_txt(day, day_blocks, txt_path, generated_at=None):
 
 
 def _write_day_html(day, day_blocks, html_path, results=None):
-    body = [
-        "<h1>Изменения форы NBA — игровой день {}</h1>".format(
-            day.strftime("%d.%m.%Y")),
-        '<div class="meta">Время московское. Здесь только игры, у которых '
-        "сдвинулась фора: все их проверки от появления в линии до начала "
-        "матча.</div>",
-        '<div class="legend"><span class="sw"></span>красная строка — фора '
-        "изменилась по сравнению с предыдущей проверкой (движение кэфов "
-        "изменением не считается)</div>",
-    ]
-    for block in day_blocks:
-        start_txt = (_fmt_check_dt(block["start"].replace(second=0, microsecond=0))
-                     if block["start"] else "—")
-        body.append(
-            '<div class="game-head">{} · начало {} · сдвигов форы: {}</div>'
-            .format(html.escape(block["name"], quote=False),
-                    start_txt, block["shifts"]))
-        for text, changed in block["lines"]:
-            cls = "line changed" if changed else "line"
-            body.append('<div class="{}">{}</div>'.format(
-                cls, html.escape(text, quote=False)))
-        for text in _final_lines(block, results):
-            body.append('<div class="final">{}</div>'.format(
-                html.escape(text, quote=False)))
-    _write_html(html_path,
-                "Изменения форы NBA — {}".format(day.strftime("%d.%m.%Y")),
-                body)
+    # HTML-версии архива изменений больше не создаются (только .txt);
+    # функция оставлена пустой для совместимости старых вызовов.
+    return None
 
 
 # ----------------------------------------------------------------------------
