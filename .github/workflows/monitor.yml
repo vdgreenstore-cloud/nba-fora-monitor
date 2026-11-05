@@ -1,25 +1,26 @@
 name: Мониторинг фор NBA
 
-# Точное расписание «раз в 30 минут»:
-# GitHub будит нас каждые 5 минут (его расписание срабатывает с задержками
-# и иногда пропускает слоты — бывало, что пропадали сразу :00 и :30), а скрипт
-# сам решает: полноценная проверка линии — ровно ОДНА в получасовой интервал
-# (:00–:29 и :30–:59 МСК), остальные запуски завершаются за пару секунд без
-# обращения к сайту. Так проверка остаётся полчасовой даже при задержках,
-# а разовый сбой сайта перепроверяется уже через 5 минут.
+# Точное расписание «раз в 30 минут», устойчивое к пропускам планировщика:
+# 1) каждый запуск (плановый или ручной) становится «караульным»: живёт ~5,3 ч,
+#    просыпается каждые 2 минуты и делает полноценную проверку линии РОВНО
+#    ОДИН раз в получасовой интервал (:00–:29 и :30–:59 МСК) — решает сам
+#    скрипт по метке last_check в data/state.json;
+# 2) после каждой проверки результаты сразу коммитятся в репозиторий;
+# 3) в начале смены караульный «передаёт смену» — запускает следующего
+#    караульного (workflow_dispatch), поэтому проверки идут непрерывно даже
+#    когда планировщик GitHub пропускает слоты (бывало — 11 из 12 подряд);
+# 4) cron */5 остаётся резервом: если цепочка оборвётся, планировщик запустит
+#    нового караульного.
 on:
   schedule:
     - cron: '*/5 * * * *'
   workflow_dispatch:
 
-env:
-  # ручной запуск (Run workflow) всегда проверяет линию немедленно
-  FORCE_CHECK: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
-
 permissions:
   contents: write
+  actions: write
 
-# Не позволяем двум проверкам выполняться одновременно
+# Один караульный за раз; лишние запуски ждут своей очереди и подхватывают смену
 concurrency:
   group: fora-monitor
   cancel-in-progress: false
@@ -27,33 +28,60 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 355
     steps:
       - name: Скачать репозиторий
         uses: actions/checkout@v4
+
+      - name: Передать смену следующему караульному
+        run: |
+          for i in 1 2 3; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+              -H "Authorization: Bearer ${{ github.token }}" \
+              -H "Accept: application/vnd.github+json" \
+              -d '{"ref":"main"}' \
+              "${GITHUB_API_URL}/repos/${{ github.repository }}/actions/workflows/monitor.yml/dispatches")
+            echo "передача смены -> HTTP $code"
+            [ "$code" = "204" ] && break
+            sleep 20
+          done
 
       - name: Установить Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Проверка линий
-        id: run
+      - name: "Караульство ~5,3 ч: проверка раз в полчаса + коммит"
+        id: guard
+        env:
+          # ручной запуск (Run workflow) проверяет линию немедленно,
+          # дальнейшие проверки в этой смене — строго по получасовому слоту
+          FORCE_CHECK: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: |
-          python3 marathon_fora_monitor.py --once --data-dir data || echo "failed=true" >> "$GITHUB_OUTPUT"
+          END=$(( $(date +%s) + 315*60 ))
+          LAST=fail
+          FORCE_ARGS=""
+          if [ "$FORCE_CHECK" = "1" ]; then FORCE_ARGS="--force"; fi
+          while [ "$(date +%s)" -lt "$END" ]; do
+            if python3 marathon_fora_monitor.py --once --data-dir data $FORCE_ARGS; then
+              LAST=ok
+            else
+              LAST=fail
+              echo "[!] проверка завершилась ошибкой — повтор через 2 минуты"
+            fi
+            FORCE_ARGS=""
+            git config user.name "fora-monitor-bot"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git pull --rebase --autostash origin main >/dev/null 2>&1 || true
+            git add data/
+            if ! git diff --cached --quiet; then
+              git commit -m "проверка $(TZ=Europe/Moscow date +'%d.%m.%Y %H:%M') мск" >/dev/null
+              git push || echo "[!] push не удался — повторим после следующей проверки"
+            fi
+            sleep 120
+          done
+          if [ "$LAST" = "fail" ]; then echo "failed=true" >> "$GITHUB_OUTPUT"; fi
 
-      - name: Сохранить результаты в репозиторий
-        run: |
-          git config user.name "fora-monitor-bot"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data/
-          if git diff --cached --quiet; then
-            echo "Изменений для коммита нет"
-          else
-            git commit -m "проверка $(TZ=Europe/Moscow date +'%d.%m.%Y %H:%M') мск"
-            git push
-          fi
-
-      - name: Пометить ошибку проверки
-        if: steps.run.outputs.failed == 'true'
+      - name: Пометить ошибку последней проверки
+        if: steps.guard.outputs.failed == 'true'
         run: exit 1
