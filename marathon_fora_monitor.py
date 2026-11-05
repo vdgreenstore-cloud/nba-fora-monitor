@@ -17,6 +17,8 @@
      выделен красной строкой) — по каждой игре от появления до начала матча
   6. Ведёт архив изменений по игровым дням: data/изменения/ГГГГ-ММ-ДД.txt|.html —
      только игры со сдвигами форы за каждый игровой день
+  7. Ведёт полные отчёты по игровым дням: data/report/Д.М.txt (5.11.txt, 6.11.txt…)
+     — все игры дня от появления в линии до закрытия линии (начала матча)
 
 Режимы:
   python3 marathon_fora_monitor.py --once                  одна проверка
@@ -385,6 +387,7 @@ def _match_blocks(matches):
         blocks.append({
             "name": m["name"],
             "start": start,
+            "first": m["first_check"],
             "lines": lines,
             "shifts": sum(1 for _, c in lines if c),
         })
@@ -500,6 +503,79 @@ def _day_head_lines(day, day_blocks):
 def _write_day_txt(day, day_blocks, txt_path):
     lines = _day_head_lines(day, day_blocks)
     lines.append("")
+    for block in day_blocks:
+        start_txt = (_fmt_check_dt(block["start"].replace(second=0, microsecond=0))
+                     if block["start"] else "—")
+        lines.append("=== {} | начало {} | сдвигов форы: {} ===".format(
+            block["name"], start_txt, block["shifts"]))
+        for text, changed in block["lines"]:
+            lines.append(("🔴 " + text) if changed else text)
+        lines.append("")
+    while lines and lines[-1] == "":
+        lines.pop()
+    tmp = txt_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, txt_path)
+
+
+def _day_of(block):
+    """Игровой день блока: дата начала матча (или первой проверки, если
+    время начала в истории так и не появилось)."""
+    return block["start"].date() if block["start"] else block["first"].date()
+
+
+def _day_file_name(day):
+    """Имя дневного файла отчёта: 5.11.txt, 6.11.txt (без ведущих нулей)."""
+    return "{}.{}.txt".format(day.day, day.month)
+
+
+def build_day_reports(csv_path, out_dir, generated_at=None):
+    """Полные отчёты по игровым дням: out_dir/Д.М.txt (5.11.txt, 6.11.txt…).
+
+    За каждый игровой день (дата начала матчей по МСК) создаёт файл,
+    где собраны ВСЕ игры этого дня и все их проверки от первого появления
+    в линии до закрытия линии (последней проверки перед началом матча).
+    Проверки после начала матча не включаются; строки со сдвигом форы
+    помечены 🔴. Пересобирается целиком после каждой проверки.
+    Возвращает список созданных файлов.
+    """
+    blocks = _match_blocks(_load_history_matches(csv_path))
+
+    days = {}  # дата игрового дня -> список блоков (отсортированы по началу)
+    for block in blocks:
+        days.setdefault(_day_of(block), []).append(block)
+
+    os.makedirs(out_dir, exist_ok=True)
+    wanted = set()
+    written = []
+    for day in sorted(days):
+        path = os.path.join(out_dir, _day_file_name(day))
+        _write_gameday_txt(day, days[day], path, generated_at)
+        written.append(path)
+        wanted.add(os.path.basename(path))
+    # дневные файлы прошлых запусков, которых больше нет в истории,
+    # удаляем — чтобы в папке остались только актуальные дни
+    for fn in os.listdir(out_dir):
+        if fn.endswith(".txt") and fn not in wanted:
+            os.remove(os.path.join(out_dir, fn))
+    return written
+
+
+def _write_gameday_txt(day, day_blocks, txt_path, generated_at=None):
+    lines = [
+        "ИГРОВОЙ ДЕНЬ {} (МСК) — все игры дня".format(day.strftime("%d.%m.%Y")),
+        "По каждой игре: все проверки от появления в линии до закрытия "
+        "(последняя проверка перед началом матча).",
+        "Формат линии: [фора 1 (кэф 1) / фора 2 (кэф 2)].",
+        "🔴 — фора изменилась относительно предыдущей проверки "
+        "(движение кэфов изменением не считается).",
+        "Обновлён: {}".format(
+            (generated_at or datetime.now(MSK)).strftime("%d.%m.%Y %H:%M МСК")),
+        "Игр: {} | из них со сдвигами форы: {}".format(
+            len(day_blocks), sum(1 for b in day_blocks if b["shifts"])),
+        "",
+    ]
     for block in day_blocks:
         start_txt = (_fmt_check_dt(block["start"].replace(second=0, microsecond=0))
                      if block["start"] else "—")
@@ -662,6 +738,13 @@ def run_once(data_dir, url, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES, qu
         build_changes_archive(csv_path, os.path.join(data_dir, "изменения"))
     except Exception as err:  # noqa: BLE001 - архив не должен ломать проверку
         print("[!] не удалось построить архив изменений: {}".format(err),
+              file=sys.stderr)
+
+    # полные отчёты по игровым дням: data/report/5.11.txt, 6.11.txt, ...
+    try:
+        build_day_reports(csv_path, os.path.join(data_dir, "report"))
+    except Exception as err:  # noqa: BLE001 - отчёты не должны ломать проверку
+        print("[!] не удалось построить отчёты по игровым дням: {}".format(err),
               file=sys.stderr)
 
     summary = ("Проверка {} МСК: матчей {}, новых {}, изменений {}, "
