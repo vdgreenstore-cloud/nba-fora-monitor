@@ -23,8 +23,15 @@
 
 Режимы:
   python3 marathon_fora_monitor.py --once                  одна проверка
+  python3 marathon_fora_monitor.py --once --force          проверка без ожидания слота
   python3 marathon_fora_monitor.py --loop                  вечный цикл (каждые 30 мин)
   python3 marathon_fora_monitor.py --loop --interval 600   свой интервал в секундах
+
+Точное расписание: проверка линии выполняется ОДИН раз в получасовой интервал
+(:00–:29 и :30–:59 МСК). GitHub Actions может будить скрипт хоть каждые 5 минут
+(его расписание срабатывает с задержками и иногда пропускает слоты) — лишние
+запуски сразу завершаются без обращения к сайту. Флаг --force (или переменная
+окружения FORCE_CHECK=1) выполняет проверку немедленно, не дожидаясь слота.
 
 Зависимости: только стандартная библиотека Python 3.8+.
 """
@@ -46,6 +53,9 @@ DEFAULT_URL = "https://www.marathonbet.ru/su/betting/Basketball/NBA"
 DEFAULT_INTERVAL = 1800  # 30 минут
 DEFAULT_TIMEOUT = 40
 DEFAULT_RETRIES = 3
+# точное расписание «раз в 30 минут»: линия проверяется один раз в получасовой
+# слот (:00–:29, :30–:59), лишние запуски завершаются сразу
+CHECK_SLOT_MINUTES = 30
 
 MSK = timezone(timedelta(hours=3))  # московское время, без перехода на летнее
 
@@ -265,6 +275,37 @@ def append_csv(path, row):
 def append_log(path, text):
     with open(path, "a", encoding="utf-8") as f:
         f.write(text + "\n")
+
+
+# ----------------------------------------------------------------------------
+# Точное расписание: одна проверка на получасовой слот
+# ----------------------------------------------------------------------------
+
+def slot_start(dt, slot_minutes=CHECK_SLOT_MINUTES):
+    """Начало получасового слота: 10:14:59 -> 10:00, 10:47 -> 10:30."""
+    m = (dt.minute // slot_minutes) * slot_minutes
+    return dt.replace(minute=m, second=0, microsecond=0)
+
+
+def should_check_now(state_path, now=None):
+    """True, если в текущем получасовом слоте линия ещё не проверялась.
+
+    Метка времени последней проверки хранится в state.json (ключ last_check).
+    Благодаря этому GitHub Actions может запускать скрипт хоть каждые 5 минут
+    (его расписание срабатывает с задержками и иногда пропускает слоты) —
+    фактическая проверка линии всё равно будет ровно одна на получасовку.
+    """
+    if now is None:
+        now = datetime.now(MSK).replace(tzinfo=None)
+    state = load_state(state_path)
+    raw = state.get("last_check") if isinstance(state, dict) else None
+    if not raw:
+        return True
+    try:
+        last = datetime.strptime(str(raw), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return True  # испорченная метка — лучше проверить, чем пропустить
+    return slot_start(last) < slot_start(now)
 
 
 # ----------------------------------------------------------------------------
@@ -872,8 +913,13 @@ def fmt_changes(prev, ev):
     return "; ".join(diffs)
 
 
-def run_once(data_dir, url, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES, quiet=False):
-    """Одна проверка. Возвращает словарь со сводкой запуска."""
+def run_once(data_dir, url, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES,
+             quiet=False, force=False):
+    """Одна проверка. Возвращает словарь со сводкой запуска.
+
+    force=True — проверить линию немедленно, не дожидаясь нового получасового
+    слота (без него проверка одна на слот, см. should_check_now).
+    """
     os.makedirs(data_dir, exist_ok=True)
     state_path = os.path.join(data_dir, "state.json")
     csv_path = os.path.join(data_dir, "history.csv")
@@ -881,6 +927,13 @@ def run_once(data_dir, url, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES, qu
 
     now = datetime.now(MSK)
     ts = now.strftime("%d.%m.%Y %H:%M:%S")
+
+    if not force and not should_check_now(state_path, now=now.replace(tzinfo=None)):
+        summary = ("Пропуск {} МСК: в этом получасовом интервале проверка уже "
+                   "была — расписание «раз в 30 минут» соблюдено.".format(ts))
+        if not quiet:
+            print(summary)
+        return {"ok": True, "skipped": True, "summary": summary}
 
     try:
         page_html = fetch_page(url, timeout=timeout, retries=retries)
@@ -937,6 +990,8 @@ def run_once(data_dir, url, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES, qu
         prev_state[ev["id"]] = list(cur)
 
     append_log(log_path, "\n".join(log_lines))
+    # метка точного расписания: в этом получасовом слоте проверка выполнена
+    prev_state["last_check"] = now.strftime("%Y-%m-%d %H:%M:%S")
     save_state(state_path, prev_state)
 
     # отчёты: динамика форы по каждой игре от появления до начала (txt + html)
@@ -956,7 +1011,7 @@ def run_once(data_dir, url, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES, qu
         print("[!] не удалось получить итоговые счёты: {}".format(err),
               file=sys.stderr)
 
-    # архив изменений по игровым дням: data/изменения/ГГГГ-ММ-ДД.txt|.html
+    # архив изменений по игровым дням: data/изменения/ГГГГ-ММ-ДД.txt
     try:
         build_changes_archive(csv_path, os.path.join(data_dir, "изменения"),
                               results_path=results_path)
@@ -999,6 +1054,9 @@ def main():
                              "(по умолчанию — рядом со скриптом)")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
+    parser.add_argument("--force", action="store_true",
+                        help="проверить немедленно, не дожидаясь нового "
+                             "получасового слота (или env FORCE_CHECK=1)")
     args = parser.parse_args()
 
     # Чтобы кириллица не ломалась в консоли Windows
@@ -1011,12 +1069,19 @@ def main():
     data_dir = args.data_dir or os.path.join(
         os.path.dirname(os.path.abspath(__file__)), "marathon_fora_data")
 
+    force = (args.force or os.environ.get("FORCE_CHECK", "").strip().lower()
+             in ("1", "true", "yes"))
+
     if args.loop:
-        print("Запущен вечный цикл: проверка каждые {} сек. Остановка — Ctrl+C.".format(
-            args.interval))
+        print("Запущен вечный цикл: пробуждение каждые {} сек, проверка линии "
+              "один раз в получасовой слот. Остановка — Ctrl+C.".format(
+                  args.interval))
+        pending_force = force  # форс действует только на первый запуск цикла
         while True:
             try:
-                run_once(data_dir, args.url, timeout=args.timeout, retries=args.retries)
+                run_once(data_dir, args.url, timeout=args.timeout,
+                         retries=args.retries, force=pending_force)
+                pending_force = False
             except KeyboardInterrupt:
                 raise
             except Exception as err:  # noqa: BLE001 - цикл не должен падать
@@ -1027,7 +1092,8 @@ def main():
                 print("Остановлено пользователем.")
                 return
     else:
-        result = run_once(data_dir, args.url, timeout=args.timeout, retries=args.retries)
+        result = run_once(data_dir, args.url, timeout=args.timeout,
+                          retries=args.retries, force=force)
         sys.exit(0 if result["ok"] else 1)
 
 
