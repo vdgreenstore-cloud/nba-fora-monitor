@@ -15,6 +15,8 @@
   4. Текущий снимок хранит в state.json
   5. Строит отчёты report.txt (🔴 = сдвиг форы) и report.html (сдвиг форы
      выделен красной строкой) — по каждой игре от появления до начала матча
+  6. Ведёт архив изменений по игровым дням: data/изменения/ГГГГ-ММ-ДД.txt|.html —
+     только игры со сдвигами форы за каждый игровой день
 
 Режимы:
   python3 marathon_fora_monitor.py --once                  одна проверка
@@ -268,65 +270,50 @@ def _report_pair(fora, price):
     return "{} ({})".format(fora or "—", price or "—")
 
 
-def _write_line_report_html(blocks, html_path, generated_at):
-    """Пишет HTML-версию отчёта: строки со сдвигом форы выделены красным
-    целиком (открывается в любом браузере)."""
-    upd = (generated_at or datetime.now(MSK)).strftime("%d.%m.%Y %H:%M МСК")
+_HTML_STYLE = (
+    "<style>"
+    "body{font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif;"
+    "margin:14px;color:#1a1a1a;}"
+    "h1{font-size:18px;margin:0 0 4px;}"
+    ".meta{color:#666;font-size:13px;margin-bottom:8px;line-height:1.5;}"
+    ".legend{font-size:12.5px;color:#444;margin:10px 0 16px;}"
+    ".legend .sw{display:inline-block;width:12px;height:12px;"
+    "background:#fdecea;border:1px solid #d32f2f;vertical-align:-1px;"
+    "margin-right:6px;}"
+    ".match{margin-bottom:14px;}"
+    ".game-head{font-weight:600;margin:14px 0 4px;font-size:14px;}"
+    ".line{font-family:Consolas,'Courier New',monospace;font-size:13.5px;"
+    "padding:3px 8px;}"
+    ".changed{background:#fdecea;color:#b71c1c;font-weight:600;"
+    "border-left:3px solid #d32f2f;}"
+    "</style>"
+)
+
+
+def _write_html(html_path, title, body_lines):
+    """Сохраняет HTML-страницу (utf-8) атомарно."""
     out = [
         "<!DOCTYPE html>",
         '<html lang="ru">',
         "<head>",
         '<meta charset="utf-8">',
         '<meta name="viewport" content="width=device-width, initial-scale=1">',
-        "<title>Динамика форы NBA — Marathonbet</title>",
-        "<style>",
-        "body{font-family:-apple-system,'Segoe UI',Roboto,Arial,sans-serif;"
-        "margin:14px;color:#1a1a1a;}",
-        "h1{font-size:18px;margin:0 0 4px;}",
-        ".meta{color:#666;font-size:13px;margin-bottom:8px;line-height:1.5;}",
-        ".legend{font-size:12.5px;color:#444;margin:10px 0 16px;}",
-        ".legend .sw{display:inline-block;width:12px;height:12px;"
-        "background:#fdecea;border:1px solid #d32f2f;vertical-align:-1px;"
-        "margin-right:6px;}",
-        ".match{margin-bottom:14px;}",
-        ".line{font-family:Consolas,'Courier New',monospace;font-size:13.5px;"
-        "padding:3px 8px;}",
-        ".changed{background:#fdecea;color:#b71c1c;font-weight:600;"
-        "border-left:3px solid #d32f2f;}",
-        "</style>",
+        "<title>{}</title>".format(html.escape(title, quote=False)),
+        _HTML_STYLE,
         "</head>",
         "<body>",
-        "<h1>Динамика форы NBA — Marathonbet</h1>",
-        '<div class="meta">Время проверок московское. Обновлён: {}.<br>'
-        "По каждой игре: все проверки от появления в линии до начала матча.<br>"
-        "Формат: [фора 1 (кэф 1) / фора 2 (кэф 2)].</div>".format(upd),
-        '<div class="legend"><span class="sw"></span>красная строка — фора '
-        "изменилась по сравнению с предыдущей проверкой (движение кэфов "
-        "изменением не считается)</div>",
-    ]
-    for block in blocks:
-        out.append('<div class="match">')
-        for text, changed in block:
-            cls = "line changed" if changed else "line"
-            out.append('<div class="{}">{}</div>'.format(
-                cls, html.escape(text, quote=False)))
-        out.append("</div>")
-    out.extend(["</body>", "</html>"])
+    ] + list(body_lines) + ["</body>", "</html>"]
     tmp = html_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write("\n".join(out) + "\n")
     os.replace(tmp, html_path)
 
 
-def build_line_report(csv_path, report_path, html_path=None, generated_at=None):
-    """Строит текстовый отчёт по истории проверок (history.csv).
+def _load_history_matches(csv_path):
+    """Читает history.csv и группирует записи по матчам.
 
-    По каждой игре — все её проверки от первого появления в линии
-    до начала матча, строка вида:
-      05 ноя 03:00 | Вашингтон Уизардс - Атланта Хокс: [+4.5 (1.80) / -4.5 (2.00)]
-    Строки, где фора сдвинулась относительно предыдущей проверки, помечаются
-    🔴 (в txt) и выделяются красной строкой (в html, если задан html_path).
-    Возвращает количество матчей, попавших в отчёт.
+    Возвращает словарь {id: {"name", "start_dated", "start_plain",
+    "first_check", "rows": [(время_проверки, строка_csv), ...]}}.
     """
     matches = {}
     with open(csv_path, encoding="utf-8-sig", newline="") as f:
@@ -356,13 +343,25 @@ def build_line_report(csv_path, report_path, html_path=None, generated_at=None):
                     m["start_dated"] = norm
             elif m["start_plain"] is None or norm < m["start_plain"]:
                 m["start_plain"] = norm
+    return matches
 
+
+def _match_blocks(matches):
+    """Собирает блоки отчёта по матчам (сортировка по времени начала).
+
+    Возвращает список словарей:
+      {"name": str, "start": datetime|None,
+       "lines": [(текст_строки, сдвиг_форы: bool)], "shifts": int}
+    Сдвигом считается изменение форы относительно ПРЕДЫДУЩЕЙ проверки
+    (движение кэфов изменением не считается). Проверки после начала
+    матча не включаются.
+    """
     def sort_key(mid):
         m = matches[mid]
         start = m["start_dated"] or m["start_plain"]
         return (start or datetime.max, m["name"])
 
-    blocks = []  # блоки: список пар (строка, изменилась_ли_фора)
+    blocks = []
     for mid in sorted(matches, key=sort_key):
         m = matches[mid]
         start = m["start_dated"] or m["start_plain"]
@@ -371,7 +370,7 @@ def build_line_report(csv_path, report_path, html_path=None, generated_at=None):
             before = [r for r in rows if r[0] <= start]
             if before:  # проверки после начала матча не показываем
                 rows = before
-        block = []
+        lines = []
         prev_fora = None
         for chk, row in rows:
             f1 = (row.get("фора 1") or "").strip()
@@ -380,11 +379,51 @@ def build_line_report(csv_path, report_path, html_path=None, generated_at=None):
                 _fmt_check_dt(chk), m["name"],
                 _report_pair(f1, row.get("кэф 1")),
                 _report_pair(f2, row.get("кэф 2")))
-            # сдвиг ФОРЫ относительно предыдущей проверки; кэфы не считаются
             changed = prev_fora is not None and (f1, f2) != prev_fora
-            block.append((text, changed))
+            lines.append((text, changed))
             prev_fora = (f1, f2)
-        blocks.append(block)
+        blocks.append({
+            "name": m["name"],
+            "start": start,
+            "lines": lines,
+            "shifts": sum(1 for _, c in lines if c),
+        })
+    return blocks
+
+
+def _write_line_report_html(blocks, html_path, generated_at):
+    """HTML-версия общего отчёта: строки со сдвигом форы — красные целиком."""
+    upd = (generated_at or datetime.now(MSK)).strftime("%d.%m.%Y %H:%M МСК")
+    body = [
+        "<h1>Динамика форы NBA — Marathonbet</h1>",
+        '<div class="meta">Время проверок московское. Обновлён: {}.<br>'
+        "По каждой игре: все проверки от появления в линии до начала матча.<br>"
+        "Формат: [фора 1 (кэф 1) / фора 2 (кэф 2)].</div>".format(upd),
+        '<div class="legend"><span class="sw"></span>красная строка — фора '
+        "изменилась по сравнению с предыдущей проверкой (движение кэфов "
+        "изменением не считается)</div>",
+    ]
+    for block in blocks:
+        body.append('<div class="match">')
+        for text, changed in block["lines"]:
+            cls = "line changed" if changed else "line"
+            body.append('<div class="{}">{}</div>'.format(
+                cls, html.escape(text, quote=False)))
+        body.append("</div>")
+    _write_html(html_path, "Динамика форы NBA — Marathonbet", body)
+
+
+def build_line_report(csv_path, report_path, html_path=None, generated_at=None):
+    """Строит текстовый отчёт по истории проверок (history.csv).
+
+    По каждой игре — все её проверки от первого появления в линии
+    до начала матча, строка вида:
+      05 ноя 03:00 | Вашингтон Уизардс - Атланта Хокс: [+4.5 (1.80) / -4.5 (2.00)]
+    Строки, где фора сдвинулась относительно предыдущей проверки, помечаются
+    🔴 (в txt) и выделяются красной строкой (в html, если задан html_path).
+    Возвращает количество матчей, попавших в отчёт.
+    """
+    blocks = _match_blocks(_load_history_matches(csv_path))
 
     lines = [
         "Динамика форы NBA — Marathonbet (время проверок московское)",
@@ -397,7 +436,7 @@ def build_line_report(csv_path, report_path, html_path=None, generated_at=None):
         "",
     ]
     for block in blocks:
-        for text, changed in block:
+        for text, changed in block["lines"]:
             lines.append(("🔴 " + text) if changed else text)
         lines.append("")
 
@@ -411,7 +450,97 @@ def build_line_report(csv_path, report_path, html_path=None, generated_at=None):
 
     if html_path:
         _write_line_report_html(blocks, html_path, generated_at)
-    return len(matches)
+    return len(blocks)
+
+
+def build_changes_archive(csv_path, out_dir, generated_at=None):
+    """Архив изменений по игровым дням.
+
+    Для каждого игрового дня (дата начала матчей по МСК), в котором хотя бы
+    у одной игры сдвинулась фора, создаёт в папке out_dir пару файлов:
+      ГГГГ-ММ-ДД.txt и ГГГГ-ММ-ДД.html
+    Внутри — только игры со сдвигами, все их проверки от появления в линии
+    до начала матча; строки со сдвигом помечены 🔴 / красным.
+    Возвращает список созданных файлов.
+    """
+    blocks = _match_blocks(_load_history_matches(csv_path))
+
+    days = {}  # дата начала матчей -> список блоков
+    for block in blocks:
+        if block["shifts"] <= 0 or block["start"] is None:
+            continue
+        days.setdefault(block["start"].date(), []).append(block)
+
+    os.makedirs(out_dir, exist_ok=True)
+    written = []
+    for day in sorted(days):
+        day_blocks = days[day]
+        stem = day.strftime("%Y-%m-%d")
+        txt_path = os.path.join(out_dir, stem + ".txt")
+        html_path = os.path.join(out_dir, stem + ".html")
+        _write_day_txt(day, day_blocks, txt_path)
+        _write_day_html(day, day_blocks, html_path)
+        written.extend([txt_path, html_path])
+    return written
+
+
+def _day_head_lines(day, day_blocks):
+    """Шапка дневного файла архива (для txt)."""
+    total_shifts = sum(b["shifts"] for b in day_blocks)
+    return [
+        "ИГРОВОЙ ДЕНЬ {} (МСК) — игры со сдвигами форы".format(
+            day.strftime("%d.%m.%Y")),
+        "Мониторинг линии: от появления игры до её начала; "
+        "движение кэфов изменением не считается.",
+        "Игр со сдвигами: {} | Сдвигов форы: {}".format(
+            len(day_blocks), total_shifts),
+    ]
+
+
+def _write_day_txt(day, day_blocks, txt_path):
+    lines = _day_head_lines(day, day_blocks)
+    lines.append("")
+    for block in day_blocks:
+        start_txt = (_fmt_check_dt(block["start"].replace(second=0, microsecond=0))
+                     if block["start"] else "—")
+        lines.append("=== {} | начало {} | сдвигов форы: {} ===".format(
+            block["name"], start_txt, block["shifts"]))
+        for text, changed in block["lines"]:
+            lines.append(("🔴 " + text) if changed else text)
+        lines.append("")
+    while lines and lines[-1] == "":
+        lines.pop()
+    tmp = txt_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(tmp, txt_path)
+
+
+def _write_day_html(day, day_blocks, html_path):
+    body = [
+        "<h1>Изменения форы NBA — игровой день {}</h1>".format(
+            day.strftime("%d.%m.%Y")),
+        '<div class="meta">Время московское. Здесь только игры, у которых '
+        "сдвинулась фора: все их проверки от появления в линии до начала "
+        "матча.</div>",
+        '<div class="legend"><span class="sw"></span>красная строка — фора '
+        "изменилась по сравнению с предыдущей проверкой (движение кэфов "
+        "изменением не считается)</div>",
+    ]
+    for block in day_blocks:
+        start_txt = (_fmt_check_dt(block["start"].replace(second=0, microsecond=0))
+                     if block["start"] else "—")
+        body.append(
+            '<div class="game-head">{} · начало {} · сдвигов форы: {}</div>'
+            .format(html.escape(block["name"], quote=False),
+                    start_txt, block["shifts"]))
+        for text, changed in block["lines"]:
+            cls = "line changed" if changed else "line"
+            body.append('<div class="{}">{}</div>'.format(
+                cls, html.escape(text, quote=False)))
+    _write_html(html_path,
+                "Изменения форы NBA — {}".format(day.strftime("%d.%m.%Y")),
+                body)
 
 
 # ----------------------------------------------------------------------------
@@ -527,6 +656,13 @@ def run_once(data_dir, url, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES, qu
                           html_path=os.path.join(data_dir, "report.html"))
     except Exception as err:  # noqa: BLE001 - отчёт не должен ломать проверку
         print("[!] не удалось построить отчёты: {}".format(err), file=sys.stderr)
+
+    # архив изменений по игровым дням: data/изменения/ГГГГ-ММ-ДД.txt|.html
+    try:
+        build_changes_archive(csv_path, os.path.join(data_dir, "изменения"))
+    except Exception as err:  # noqa: BLE001 - архив не должен ломать проверку
+        print("[!] не удалось построить архив изменений: {}".format(err),
+              file=sys.stderr)
 
     summary = ("Проверка {} МСК: матчей {}, новых {}, изменений {}, "
                "без изменений {} (без линии {}).".format(
