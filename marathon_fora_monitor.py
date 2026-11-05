@@ -16,7 +16,8 @@
   5. Строит отчёты report.txt (🔴 = сдвиг форы) и report.html (сдвиг форы
      выделен красной строкой) — по каждой игре от появления до начала матча
   6. Ведёт архив изменений по игровым дням: data/изменения/ГГГГ-ММ-ДД.txt|.html —
-     только игры со сдвигами форы за каждый игровой день
+     только игры со сдвигами форы за каждый игровой день; после завершения
+     матча в конце его блока появляется итоговый счёт (с пометкой об овертайме)
   7. Ведёт полные отчёты по игровым дням: data/report/Д.М.txt (5.11.txt, 6.11.txt…)
      — все игры дня от появления в линии до закрытия линии (начала матча)
 
@@ -47,6 +48,49 @@ DEFAULT_TIMEOUT = 40
 DEFAULT_RETRIES = 3
 
 MSK = timezone(timedelta(hours=3))  # московское время, без перехода на летнее
+
+# Публичный API ESPN — итоговые счёты завершившихся матчей NBA
+ESPN_SCOREBOARD = ("http://site.api.espn.com/apis/site/v2/sports/"
+                   "basketball/nba/scoreboard?dates={date}")
+# сколько часов после начала матча ждём, прежде чем искать итог (примерно
+# длится матч 2-2.5 часа, плюс возможный овертайм и перерывы)
+GAME_OVER_AFTER = timedelta(hours=2, minutes=40)
+# сколько раз можно пытаться найти счёт матча, прежде чем перестать
+SCORE_MAX_TRIES = 8
+
+# русские названия команд у Marathonbet -> аббревиатуры ESPN
+TEAM_ABBR = {
+    "Атланта Хокс": "ATL",
+    "Бостон Селтикс": "BOS",
+    "Бруклин Нетс": "BKN",
+    "Шарлотт Хорнетс": "CHA",
+    "Чикаго Буллз": "CHI",
+    "Кливленд Кавальерс": "CLE",
+    "Даллас Маверикс": "DAL",
+    "Денвер Наггетс": "DEN",
+    "Детройт Пистонс": "DET",
+    "Голден Стэйт Уорриорз": "GSW",
+    "Хьюстон Рокетс": "HOU",
+    "Индиана Пэйсерс": "IND",
+    "Лос-Анджелес Клипперс": "LAC",
+    "Лос-Анджелес Лейкерс": "LAL",
+    "Мемфис Гриззлис": "MEM",
+    "Майами Хит": "MIA",
+    "Милуоки Бакс": "MIL",
+    "Миннесота Тимбервулвз": "MIN",
+    "Нью-Орлеан Пеликанс": "NOP",
+    "Нью-Йорк Никс": "NY",
+    "Оклахома-Сити Тандер": "OKC",
+    "Орландо Мэджик": "ORL",
+    "Филадельфия 76-е": "PHI",
+    "Финикс Санз": "PHX",
+    "Портленд Трэйл Блэйзерс": "POR",
+    "Сакраменто Кингз": "SAC",
+    "Сан-Антонио Сперс": "SAS",
+    "Торонто Рэпторс": "TOR",
+    "Юта Джаз": "UTA",
+    "Вашингтон Уизардс": "WAS",
+}
 
 CSV_COLUMNS = [
     "время проверки", "id матча", "матч", "начало (МСК)",
@@ -288,6 +332,9 @@ _HTML_STYLE = (
     "padding:3px 8px;}"
     ".changed{background:#fdecea;color:#b71c1c;font-weight:600;"
     "border-left:3px solid #d32f2f;}"
+    ".final{font-family:Consolas,'Courier New',monospace;font-size:13.5px;"
+    "padding:3px 8px;color:#1b5e20;font-weight:600;"
+    "border-left:3px solid #2e7d32;margin-top:2px;}"
     "</style>"
 )
 
@@ -385,6 +432,7 @@ def _match_blocks(matches):
             lines.append((text, changed))
             prev_fora = (f1, f2)
         blocks.append({
+            "mid": mid,
             "name": m["name"],
             "start": start,
             "first": m["first_check"],
@@ -456,17 +504,166 @@ def build_line_report(csv_path, report_path, html_path=None, generated_at=None):
     return len(blocks)
 
 
-def build_changes_archive(csv_path, out_dir, generated_at=None):
+def _split_team_names(match_name):
+    """'Вашингтон Уизардс - Атланта Хокс' -> ('Вашингтон Уизардс', 'Атланта Хокс').
+    Разделитель — ' - ' (с пробелами); названия команд дефис без пробелов
+    ('Лос-Анджелес Клипперс') не разрезают."""
+    parts = match_name.split(" - ")
+    if len(parts) != 2:
+        return None
+    return parts[0].strip(), parts[1].strip()
+
+
+def _match_abbrs(match_name):
+    """Пара аббревиатур ESPN для матча или None, если команда не распознана."""
+    names = _split_team_names(match_name or "")
+    if names is None:
+        return None
+    try:
+        return TEAM_ABBR[names[0]], TEAM_ABBR[names[1]]
+    except KeyError:
+        return None
+
+
+def _load_results(path):
+    """Читает кэш итоговых счётов data/results.json.
+
+    Формат: {id матча: {"score": "126:115"|None, "ot": bool, "tries": int}}
+    """
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_results(path, results):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=1, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def _fetch_espn_scoreboard(date, timeout=DEFAULT_TIMEOUT):
+    """Итоги NBA за дату (дата по восточно-американскому времени).
+
+    Возвращает словарь {frozenset({abbr1, abbr2}): {"scores": {abbr: очки},
+    "ot": bool}} по ЗАВЕРШЁННЫМ матчам этого дня.
+    """
+    url = ESPN_SCOREBOARD.format(date=date.strftime("%Y%m%d"))
+    req = urllib.request.Request(url, headers={"User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8", errors="replace"))
+    out = {}
+    for ev in data.get("events", []):
+        try:
+            comp = ev["competitions"][0]
+            status = ev["status"]
+            if not status.get("type", {}).get("completed"):
+                continue
+            abbrs, scores = set(), {}
+            for c in comp["competitors"]:
+                abbr = (c.get("team") or {}).get("abbreviation", "").upper()
+                abbrs.add(abbr)
+                try:
+                    scores[abbr] = int(c.get("score"))
+                except (TypeError, ValueError):
+                    scores[abbr] = None
+            if len(abbrs) != 2 or any(v is None for v in scores.values()):
+                continue
+            ot = status.get("period", 4) >= 5 or "OT" in (
+                status.get("type", {}).get("description") or "")
+            out[frozenset(abbrs)] = ({"scores": scores, "ot": ot})
+        except (KeyError, IndexError, TypeError):
+            continue
+    return out
+
+
+def fetch_final_scores(csv_path, results_path, timeout=DEFAULT_TIMEOUT):
+    """Дополняет кэш results.json итоговыми счётами завершившихся матчей.
+
+    Матч считается завершённым, если прошло >= 2.5 ч с начала; счёт ищется
+    в результатах NBA за соответствующий день (по времени США, с запасным
+    предыдущим днём). Счёт записывается в порядке команд Marathonbet:
+    "итоговый счёт X:Y" — X очков первой команды в названии матча.
+    Возвращает число вновь найденных счётов.
+    """
+    matches = _load_history_matches(csv_path)
+    results = _load_results(results_path)
+    now = datetime.now(MSK)
+
+    pending = []  # (id, матч, начало)
+    for mid, m in matches.items():
+        start = m["start_dated"] or m["start_plain"]
+        if start is None or now < start + GAME_OVER_AFTER:
+            continue  # ещё не должен был закончиться
+        rec = results.get(mid) or {}
+        if rec.get("score"):
+            continue  # счёт уже известен
+        if rec.get("tries", 0) >= SCORE_MAX_TRIES:
+            continue  # так и не нашли — больше не ищем
+        if _match_abbrs(m["name"]) is None:
+            continue  # неизвестное название команды
+        pending.append((mid, m["name"], start))
+    if not pending:
+        return 0
+
+    # у NBA матч начинается 12:00-22:59 по Востоку (ET = МСК - 8 ч);
+    # для подстраховки ищем и за предыдущую дату
+    dates = set()
+    for _, _, start in pending:
+        et = start - timedelta(hours=8)
+        dates.add(et.date())
+        dates.add(et.date() - timedelta(days=1))
+
+    boards = {}
+    for d in sorted(dates):
+        try:
+            boards[d] = _fetch_espn_scoreboard(d, timeout=timeout)
+        except Exception as err:  # noqa: BLE001 - сеть/сайт: попробуем в следующий раз
+            print("[!] ESPN {}: {}".format(d.strftime("%d.%m.%Y"), err),
+                  file=sys.stderr)
+            boards[d] = {}
+
+    found = 0
+    for mid, name, start in pending:
+        abbrs = _match_abbrs(name)
+        key = frozenset(abbrs)
+        rec = results.setdefault(mid, {"score": None, "ot": False, "tries": 0})
+        rec["tries"] = rec.get("tries", 0) + 1
+        et = start - timedelta(hours=8)
+        hit = None
+        for d in (et.date(), et.date() - timedelta(days=1)):
+            if key in boards.get(d, {}):
+                hit = boards[d][key]
+                break
+        if hit is not None:
+            # счёт в порядке команд из названия матча (первая:вторая)
+            sc = hit["scores"]
+            rec["score"] = "{}:{}".format(sc[abbrs[0]], sc[abbrs[1]])
+            rec["ot"] = bool(hit.get("ot"))
+            found += 1
+    _save_results(results_path, results)
+    return found
+
+
+def build_changes_archive(csv_path, out_dir, generated_at=None, results_path=None):
     """Архив изменений по игровым дням.
 
     Для каждого игрового дня (дата начала матчей по МСК), в котором хотя бы
     у одной игры сдвинулась фора, создаёт в папке out_dir пару файлов:
       ГГГГ-ММ-ДД.txt и ГГГГ-ММ-ДД.html
     Внутри — только игры со сдвигами, все их проверки от появления в линии
-    до начала матча; строки со сдвигом помечены 🔴 / красным.
+    до начала матча; строки со сдвигом помечены 🔴 / красным; после завершения
+    матча в конце его блока добавляется строка «Итоговый счёт: X:Y»
+    (с пометкой об овертайме, если он был) из кэша results.json.
     Возвращает список созданных файлов.
     """
     blocks = _match_blocks(_load_history_matches(csv_path))
+    results = _load_results(results_path)
 
     days = {}  # дата начала матчей -> список блоков
     for block in blocks:
@@ -481,8 +678,8 @@ def build_changes_archive(csv_path, out_dir, generated_at=None):
         stem = day.strftime("%Y-%m-%d")
         txt_path = os.path.join(out_dir, stem + ".txt")
         html_path = os.path.join(out_dir, stem + ".html")
-        _write_day_txt(day, day_blocks, txt_path)
-        _write_day_html(day, day_blocks, html_path)
+        _write_day_txt(day, day_blocks, txt_path, results)
+        _write_day_html(day, day_blocks, html_path, results)
         written.extend([txt_path, html_path])
     return written
 
@@ -500,7 +697,23 @@ def _day_head_lines(day, day_blocks):
     ]
 
 
-def _write_day_txt(day, day_blocks, txt_path):
+def _final_lines(block, results):
+    """Строка (или пустой список) с итоговым счётом после блока матча.
+
+    Счёт известен, если матч завершился и итог найден в кэше results.json
+    (results передаются как {id матча: {...}}).
+    """
+    rec = (results or {}).get(block.get("mid")) or {}
+    score = rec.get("score")
+    if not score:
+        return []
+    line = "Итоговый счёт: {}".format(score)
+    if rec.get("ot"):
+        line += " (овертайм)"
+    return [line]
+
+
+def _write_day_txt(day, day_blocks, txt_path, results=None):
     lines = _day_head_lines(day, day_blocks)
     lines.append("")
     for block in day_blocks:
@@ -510,6 +723,7 @@ def _write_day_txt(day, day_blocks, txt_path):
             block["name"], start_txt, block["shifts"]))
         for text, changed in block["lines"]:
             lines.append(("🔴 " + text) if changed else text)
+        lines.extend(_final_lines(block, results))
         lines.append("")
     while lines and lines[-1] == "":
         lines.pop()
@@ -592,7 +806,7 @@ def _write_gameday_txt(day, day_blocks, txt_path, generated_at=None):
     os.replace(tmp, txt_path)
 
 
-def _write_day_html(day, day_blocks, html_path):
+def _write_day_html(day, day_blocks, html_path, results=None):
     body = [
         "<h1>Изменения форы NBA — игровой день {}</h1>".format(
             day.strftime("%d.%m.%Y")),
@@ -614,6 +828,9 @@ def _write_day_html(day, day_blocks, html_path):
             cls = "line changed" if changed else "line"
             body.append('<div class="{}">{}</div>'.format(
                 cls, html.escape(text, quote=False)))
+        for text in _final_lines(block, results):
+            body.append('<div class="final">{}</div>'.format(
+                html.escape(text, quote=False)))
     _write_html(html_path,
                 "Изменения форы NBA — {}".format(day.strftime("%d.%m.%Y")),
                 body)
@@ -733,9 +950,20 @@ def run_once(data_dir, url, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES, qu
     except Exception as err:  # noqa: BLE001 - отчёт не должен ломать проверку
         print("[!] не удалось построить отчёты: {}".format(err), file=sys.stderr)
 
+    # итоговые счёты завершившихся матчей (кэш data/results.json)
+    results_path = os.path.join(data_dir, "results.json")
+    try:
+        found_scores = fetch_final_scores(csv_path, results_path)
+        if found_scores:
+            print("Найдено итоговых счётов: {}".format(found_scores))
+    except Exception as err:  # noqa: BLE001 - счёты не должны ломать проверку
+        print("[!] не удалось получить итоговые счёты: {}".format(err),
+              file=sys.stderr)
+
     # архив изменений по игровым дням: data/изменения/ГГГГ-ММ-ДД.txt|.html
     try:
-        build_changes_archive(csv_path, os.path.join(data_dir, "изменения"))
+        build_changes_archive(csv_path, os.path.join(data_dir, "изменения"),
+                              results_path=results_path)
     except Exception as err:  # noqa: BLE001 - архив не должен ломать проверку
         print("[!] не удалось построить архив изменений: {}".format(err),
               file=sys.stderr)
