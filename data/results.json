@@ -93,5 +93,25 @@
   "ot": false,
   "score": "119:95",
   "tries": 1
+ },
+ "30101050": {
+  "ot": false,
+  "score": "107:121",
+  "tries": 1
+ },
+ "30101057": {
+  "ot": false,
+  "score": "109:115",
+  "tries": 1
+ },
+ "30101064": {
+  "ot": false,
+  "score": "97:128",
+  "tries": 1
+ },
+ "30101071": {
+  "ot": false,
+  "score": "112:100",
+  "tries": 1
  }
 }
