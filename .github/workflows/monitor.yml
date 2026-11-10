@@ -5,7 +5,9 @@ name: Мониторинг фор NBA
 #    просыпается каждые 2 минуты и делает полноценную проверку линии РОВНО
 #    ОДИН раз в получасовой интервал (:00–:29 и :30–:59 МСК) — решает сам
 #    скрипт по метке last_check в data/state.json;
-# 2) после каждой проверки результаты сразу коммитятся в репозиторий;
+# 2) после каждой успешной проверки результаты сразу коммитятся в репозиторий;
+#    если сайт недоступен — отдельный честный коммит «ошибка проверки …»
+#    не чаще раза в 30 минут, а следующая попытка через 10 минут (без спама);
 # 3) в начале смены караульный «передаёт смену» — запускает следующего
 #    караульного (workflow_dispatch), поэтому проверки идут непрерывно даже
 #    когда планировщик GitHub пропускает слоты (бывало — 11 из 12 подряд);
@@ -62,23 +64,34 @@ jobs:
           LAST=fail
           FORCE_ARGS=""
           if [ "$FORCE_CHECK" = "1" ]; then FORCE_ARGS="--force"; fi
+          SLEEP=120
+          NEXT_ERR_COMMIT=0
           while [ "$(date +%s)" -lt "$END" ]; do
             if python3 marathon_fora_monitor.py --once --data-dir data $FORCE_ARGS; then
               LAST=ok
+              SLEEP=120
+              MSG="проверка $(TZ=Europe/Moscow date +'%d.%m.%Y %H:%M') мск"
             else
               LAST=fail
-              echo "[!] проверка завершилась ошибкой — повтор через 2 минуты"
+              SLEEP=600
+              MSG="ошибка проверки $(TZ=Europe/Moscow date +'%d.%m.%Y %H:%M') мск — сайт недоступен"
             fi
             FORCE_ARGS=""
             git config user.name "fora-monitor-bot"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git pull --rebase --autostash origin main >/dev/null 2>&1 || true
             git add data/
-            if ! git diff --cached --quiet; then
-              git commit -m "проверка $(TZ=Europe/Moscow date +'%d.%m.%Y %H:%M') мск" >/dev/null
-              git push || echo "[!] push не удался — повторим после следующей проверки"
+            CAN_COMMIT=1
+            NOW_TS=$(date +%s)
+            if [ "$LAST" = "fail" ] && [ "$NOW_TS" -lt "$NEXT_ERR_COMMIT" ]; then
+              CAN_COMMIT=0   # ошибки коммитим не чаще раза в 30 минут
             fi
-            sleep 120
+            if [ "$CAN_COMMIT" = "1" ] && ! git diff --cached --quiet; then
+              git commit -m "$MSG" >/dev/null
+              git push || echo "[!] push не удался — повторим после следующей проверки"
+              if [ "$LAST" = "fail" ]; then NEXT_ERR_COMMIT=$(( $(date +%s) + 1800 )); fi
+            fi
+            sleep $SLEEP
           done
           if [ "$LAST" = "fail" ]; then echo "failed=true" >> "$GITHUB_OUTPUT"; fi
 
