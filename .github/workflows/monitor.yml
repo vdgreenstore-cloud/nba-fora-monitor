@@ -77,6 +77,8 @@ jobs:
               MSG="ошибка проверки $(TZ=Europe/Moscow date +'%d.%m.%Y %H:%M') мск — сайт недоступен"
             fi
             FORCE_ARGS=""
+            # страховка: вырезаем случайные маркеры git-конфликта из log.txt
+            sed -i '/^<<<<<<</d; /^>>>>>>>/d; /^=======$/d' data/log.txt 2>/dev/null || true
             git config user.name "fora-monitor-bot"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git pull --rebase --autostash origin main >/dev/null 2>&1 || true
