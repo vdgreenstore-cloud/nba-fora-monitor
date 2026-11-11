@@ -55,15 +55,17 @@ jobs:
 
       - name: "Караульство ~5,3 ч: проверка раз в полчаса + коммит"
         id: guard
-        env:
-          # ручной запуск (Run workflow) проверяет линию немедленно,
-          # дальнейшие проверки в этой смене — строго по получасовому слоту
-          FORCE_CHECK: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: |
           END=$(( $(date +%s) + 315*60 ))
           LAST=fail
           FORCE_ARGS=""
-          if [ "$FORCE_CHECK" = "1" ]; then FORCE_ARGS="--force"; fi
+          # Форс — ТОЛЬКО на первую проверку смены (при ручном запуске).
+          # ВАЖНО: нельзя задавать FORCE_CHECK через env на весь шаг:
+          # скрипт читает эту переменную при КАЖДОМ вызове, и тогда все
+          # проверки смены идут мимо слотового шлюза (каждые 2 минуты —
+          # инцидент 11–12.11.2026, запуск #238). Шлюз у скрипта свой,
+          # по метке last_check в data/state.json.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then FORCE_ARGS="--force"; fi
           SLEEP=120
           NEXT_ERR_COMMIT=0
           while [ "$(date +%s)" -lt "$END" ]; do
