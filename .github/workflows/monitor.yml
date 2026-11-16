@@ -58,18 +58,19 @@ jobs:
         run: |
           END=$(( $(date +%s) + 315*60 ))
           LAST=fail
-          FORCE_ARGS=""
-          # Форс — ТОЛЬКО на первую проверку смены (при ручном запуске).
-          # ВАЖНО: нельзя задавать FORCE_CHECK через env на весь шаг:
-          # скрипт читает эту переменную при КАЖДОМ вызове, и тогда все
-          # проверки смены идут мимо слотового шлюза (каждые 2 минуты —
-          # инцидент 11–12.11.2026, запуск #238). Шлюз у скрипта свой,
-          # по метке last_check в data/state.json.
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then FORCE_ARGS="--force"; fi
+          # --force НЕ используем вовсе. Слотовый шлюз скрипта (last_check в
+          # data/state.json) сам решает: текущий получасовой слот ещё не
+          # проверен — проверяет немедленно (в т.ч. после многочасового
+          # простоя), уже проверен — пропускает без записи в data.
+          # Форс на первой проверке смены давал лишние коммиты подряд,
+          # когда смену принимали два запуска друг за другом
+          # (16.11.2026 06:11 и 06:13 мск). А FORCE_CHECK через env на весь
+          # шаг вообще приводил к проверкам каждые 2 минуты
+          # (инцидент 11–12.11.2026, запуск #238).
           SLEEP=120
           NEXT_ERR_COMMIT=0
           while [ "$(date +%s)" -lt "$END" ]; do
-            if python3 marathon_fora_monitor.py --once --data-dir data $FORCE_ARGS; then
+            if python3 marathon_fora_monitor.py --once --data-dir data; then
               LAST=ok
               SLEEP=120
               MSG="проверка $(TZ=Europe/Moscow date +'%d.%m.%Y %H:%M') мск"
@@ -78,7 +79,6 @@ jobs:
               SLEEP=600
               MSG="ошибка проверки $(TZ=Europe/Moscow date +'%d.%m.%Y %H:%M') мск — сайт недоступен"
             fi
-            FORCE_ARGS=""
             # страховка: вырезаем случайные маркеры git-конфликта из log.txt
             sed -i '/^<<<<<<</d; /^>>>>>>>/d; /^=======$/d' data/log.txt 2>/dev/null || true
             git config user.name "fora-monitor-bot"
