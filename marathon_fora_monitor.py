@@ -10,7 +10,8 @@
      изменилась линия или нет. Изменением считается только сдвиг ФОРЫ;
      коэффициенты записываются в историю, но их движение не считается
      изменением:
-        - в читаемый лог   log.txt
+        - в читаемый лог   log.txt (пересобирается из history.csv со
+          схлопыванием длинных серий «без изменений»)
         - в историю        history.csv (открывается в Excel)
   4. Текущий снимок хранит в state.json
   5. Строит отчёты report.txt (🔴 = сдвиг форы) и report.html (сдвиг форы
@@ -22,7 +23,9 @@
      — все игры дня от появления в линии до закрытия линии (начала матча)
   8. Схлопывает длинные периоды без изменений: если фора не менялась 2 часа
      и дольше, промежуточные проверки «без изменений» убираются — остаётся
-     последнее изменение и строка «··· далее N проверок без изменений…»
+     последнее изменение и строка «··· далее N проверок без изменений…».
+     Работает в отчётах (report.txt, report.html, data/report/…)
+     и в журнале log.txt
 
 Режимы:
   python3 marathon_fora_monitor.py --once                  одна проверка
@@ -422,6 +425,15 @@ def _checks_plural(n):
     if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
         return "{} проверки".format(n)
     return "{} проверок".format(n)
+
+
+def _matches_plural(n):
+    """'5 матчей' / '3 матча' / '1 матч'."""
+    if n % 10 == 1 and n % 100 != 11:
+        return "{} матч".format(n)
+    if n % 10 in (2, 3, 4) and n % 100 not in (12, 13, 14):
+        return "{} матча".format(n)
+    return "{} матчей".format(n)
 
 
 def _compress_lines(lines):
@@ -987,6 +999,172 @@ def _write_day_html(day, day_blocks, html_path, results=None):
 
 
 # ----------------------------------------------------------------------------
+# Читаемый журнал log.txt: пересборка из history.csv со схлопыванием
+# ----------------------------------------------------------------------------
+
+def _log_detail(row, prev_fora):
+    """Описание линии одного матча для строки журнала log.txt.
+
+    row — запись history.csv текущей проверки; prev_fora — (фора1, фора2)
+    той же игры из предыдущей проверки (или None). Формат совпадает с тем,
+    что скрипт писал в журнал напрямую: 'фора Команда 1: -9.5 (1.93), ...',
+    при сдвиге форы — 'было [...] → стало [...]; фора 1: X → Y'.
+    """
+    def val(raw):
+        raw = (raw or "").strip()
+        return raw if raw else None
+
+    f1, f2 = val(row.get("фора 1")), val(row.get("фора 2"))
+    k1, k2 = val(row.get("кэф 1")), val(row.get("кэф 2"))
+    status = (row.get("статус") or "").strip()
+    teams = _split_team_names((row.get("матч") or "").strip()) \
+        or ("команда 1", "команда 2")
+    t1, t2 = teams
+
+    def pair(fora, kef):
+        return "{} ({})".format(fora if fora is not None else "—",
+                                kef if kef is not None else "—")
+
+    if f1 is None and f2 is None:
+        return "фора не выставлена"
+    if status == "ИЗМЕНЕНИЕ" and prev_fora is not None:
+        diffs = []
+        if (f1 or None) != (prev_fora[0] or None):
+            diffs.append("фора 1: {} → {}".format(
+                prev_fora[0] or "—", f1 or "—"))
+        if (f2 or None) != (prev_fora[1] or None):
+            diffs.append("фора 2: {} → {}".format(
+                prev_fora[1] or "—", f2 or "—"))
+        if diffs:  # форы действительно сдвинулись
+            return "было [{}/{}] → стало [{}/{}]; {}".format(
+                prev_fora[0] or "—", prev_fora[1] or "—",
+                f1 or "—", f2 or "—", "; ".join(diffs))
+        # статус «ИЗМЕНЕНИЕ», но форы те же (двигались только кэфы —
+        # так писали ранние версии) — показываем просто текущую линию
+    return "фора {}: {}, {}: {}".format(
+        t1, pair(f1, k1), t2, pair(f2, k2))
+
+
+def _log_check_lines(rows, last_fora, only_new=False):
+    """Строки одной проверки для журнала log.txt.
+
+    rows — записи history.csv этой проверки (в порядке страницы);
+    last_fora — словарь {id матча: (фора1, фора2)} с состоянием ПОСЛЕДНЕЙ
+    проверки, обновляется по ВСЕМ строкам (даже пропущенным — иначе
+    сломается контекст «было → стало»); only_new=True выводит только новые
+    матчи и сдвиги форы. Возвращает список строк.
+    """
+    lines = []
+    for row in rows:
+        mid = (row.get("id матча") or row.get("матч") or "").strip()
+        status = (row.get("статус") or "").strip()
+        if not only_new or status != "БЕЗ ИЗМЕНЕНИЙ":
+            lines.append("{} | {}: {}".format(
+                (row.get("начало (МСК)") or "—").strip(),
+                (row.get("матч") or "—").strip(),
+                _log_detail(row, last_fora.get(mid))))
+        last_fora[mid] = ((row.get("фора 1") or "").strip(),
+                          (row.get("фора 2") or "").strip())
+    return lines
+
+
+def build_log_txt(csv_path, log_path, keep_errors=20):
+    """Пересобирает журнал log.txt из history.csv как журнал изменений.
+
+    В каждой проверке выводятся ТОЛЬКО новые матчи и сдвиги форы
+    («было → стало»); если остальные матчи не двигались — в конце блока
+    строка «··· остальные N матчей: без изменений ···». Проверки, в которых
+    не сдвинулась ни одна фора, подряд идущие длиной 2 часа и больше
+    (STABLE_COMPRESS_AFTER), заменяются одной строкой «··· далее N проверок
+    без изменений (…) ···»; серии короче — краткими блоками «··· без
+    изменений ···». Строки ошибок связи ([!] …) из старого журнала
+    сохраняются в конце файла (последние keep_errors).
+    """
+    checks = {}  # время проверки -> [записи csv]
+    with open(csv_path, encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f, delimiter=";"):
+            try:
+                chk = _parse_check_dt(row.get("время проверки") or "")
+            except ValueError:
+                continue
+            checks.setdefault(chk, []).append(row)
+
+    chks = sorted(checks)
+    interesting = {
+        chk: any((r.get("статус") or "").strip() != "БЕЗ ИЗМЕНЕНИЙ"
+                 for r in checks[chk])
+        for chk in chks
+    }
+
+    out = ["Журнал проверок линии NBA (Marathonbet) — московское время.",
+           "В проверках показаны только новые матчи и сдвиги форы; серии",
+           "проверок «без изменений» дольше 2 часов схлопнуты в строки «···».",
+           ""]
+
+    def block(chk):
+        """Заголовок + строки одной проверки (только новое и сдвиги)."""
+        rows = checks[chk]
+        new_n = sum(1 for r in rows
+                    if (r.get("статус") or "").strip() == "НОВЫЙ МАТЧ")
+        chg_n = sum(1 for r in rows
+                    if (r.get("статус") or "").strip() == "ИЗМЕНЕНИЕ")
+        head = "=== {} МСК | матчей: {}".format(
+            chk.strftime("%d.%m.%Y %H:%M:%S"), len(rows))
+        if new_n:
+            head += ", новых: {}".format(new_n)
+        if chg_n:
+            head += ", сдвигов: {}".format(chg_n)
+        lines = [head + " ==="]
+        lines.extend(_log_check_lines(rows, last_fora, only_new=True))
+        same_n = len(rows) - new_n - chg_n
+        if same_n > 0:
+            lines.append("··· остальные {} без изменений ···".format(
+                _matches_plural(same_n)))
+        return lines
+
+    last_fora = {}  # id матча -> (фора1, фора2) после последней проверки
+    i, n = 0, len(chks)
+    while i < n:
+        if interesting[chks[i]]:
+            out.extend(block(chks[i]))
+            out.append("")
+            i += 1
+            continue
+        j = i
+        while j < n and not interesting[chks[j]]:
+            j += 1
+        run = chks[i:j]
+        if len(run) >= 2 and run[-1] - run[0] >= STABLE_COMPRESS_AFTER:
+            out.append("··· далее {} без изменений ({} → {}) ···".format(
+                _checks_plural(len(run)),
+                _fmt_check_dt(run[0]), _fmt_check_dt(run[-1])))
+        else:
+            for chk in run:
+                out.append("=== {} МСК | матчей: {} ===".format(
+                    chk.strftime("%d.%m.%Y %H:%M:%S"), len(checks[chk])))
+                out.append("··· без изменений ···")
+            out.append("")
+        i = j
+
+    # строки ошибок связи из старого журнала сохраняем в конце
+    errors = []
+    if os.path.exists(log_path):
+        try:
+            with open(log_path, encoding="utf-8", errors="replace") as f:
+                errors = [ln.rstrip("\n") for ln in f if ln.startswith("[!]")]
+        except OSError:
+            errors = []
+    if errors:
+        out.append("=== последние ошибки связи ===")
+        out.extend(errors[-keep_errors:])
+
+    tmp = log_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("\n".join(out) + "\n")
+    os.replace(tmp, log_path)
+
+
+# ----------------------------------------------------------------------------
 # Один цикл проверки
 # ----------------------------------------------------------------------------
 
@@ -1102,7 +1280,14 @@ def run_once(data_dir, url, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES,
         # обновляем состояние
         prev_state[ev["id"]] = list(cur)
 
-    append_log(log_path, "\n".join(log_lines))
+    # журнал log.txt: пересборка из history.csv со схлопыванием серий
+    # «без изменений»; если пересборка не удалась — пишем сырой лог как раньше
+    try:
+        build_log_txt(csv_path, log_path)
+    except Exception as err:  # noqa: BLE001 - журнал не должен ломать проверку
+        print("[!] не удалось пересобрать log.txt: {}".format(err),
+              file=sys.stderr)
+        append_log(log_path, "\n".join(log_lines))
     # метка точного расписания: в этом получасовом слоте проверка выполнена
     prev_state["last_check"] = now.strftime("%Y-%m-%d %H:%M:%S")
     save_state(state_path, prev_state)
