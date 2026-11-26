@@ -1416,6 +1416,24 @@ def run_once(data_dir, url, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES,
     pending = prev_state.get("tg_pending") \
         if isinstance(prev_state.get("tg_pending"), dict) else {}
 
+    # Одноразовый тест связи: при первом запуске с настроенным Telegram
+    # шлём короткое подтверждение в канал; флаг tg_test_sent в state.json
+    # не даёт повторяться. Локальные запуски без TG_TOKEN/TG_CHAT блок
+    # не выполняют вовсе.
+    if tg_token and tg_chat and not prev_state.get("tg_test_sent"):
+        _ok, _err = send_telegram(
+            tg_token, tg_chat,
+            "Проверка связи: уведомления Telegram подключены. "
+            "При переходе форы через ноль «минус → плюс» сообщение "
+            "придёт в этот канал.")
+        prev_state["tg_test_sent"] = ts
+        if _ok:
+            append_tg_log(tg_log_path, "{} | тест связи | отправлено".format(ts))
+        else:
+            append_tg_log(tg_log_path,
+                          "{} | тест связи | ОШИБКА: {}".format(ts, _err))
+            print("[!] Telegram (тест связи): {}".format(_err), file=sys.stderr)
+
     stats = {"total": len(events), "new": 0, "changed": 0, "same": 0, "noline": 0}
 
     log_lines = ["=== {} МСК | матчей на странице: {} ===".format(ts, len(events))]
