@@ -26,6 +26,9 @@
      последнее изменение и строка «··· далее N проверок без изменений…».
      Работает в отчётах (report.txt, report.html, data/report/…)
      и в журнале log.txt
+  9. Шлёт уведомление в Telegram-канал, когда фора 1 проходит через
+     ноль «минус → плюс» (например −1.5 → +1.5); включается секретами
+     TG_TOKEN и TG_CHAT (на GitHub), журнал отправок — data/tg_log.txt
 
 Режимы:
   python3 marathon_fora_monitor.py --once                  одна проверка
@@ -1249,6 +1252,125 @@ def fmt_changes(prev, ev):
     return "; ".join(diffs)
 
 
+# ----------------------------------------------------------------------------
+# Telegram: уведомления о переходе форы через ноль (минус -> плюс)
+# ----------------------------------------------------------------------------
+
+# Включается, если заданы обе переменные окружения: TG_TOKEN (токен бота
+# от @BotFather) и TG_CHAT (ID канала, вида -100…). На GitHub они берутся
+# из секретов репозитория (см. monitor.yml). Без них монитор работает
+# как раньше — только без уведомлений.
+TG_ENV_TOKEN = "TG_TOKEN"
+TG_ENV_CHAT = "TG_CHAT"
+
+
+def _fora_float(value):
+    """'-3.5' -> -3.5; None, пустая строка или мусор -> None."""
+    if value is None:
+        return None
+    try:
+        return float(str(value).replace(",", "."))
+    except ValueError:
+        return None
+
+
+def detect_minus_to_plus(prev, ev):
+    """Фора 1 прошла с МИНУСА на ПЛЮС по сравнению с прошлым снимком?
+
+    prev — снимок из state.json [фора1, кэф1, фора2, кэф2, (время)];
+    ev — текущее событие. Считается только пересечение нуля: фора была
+    отрицательной (например −1.5), стала положительной (например +1.5).
+    Обычные сдвиги (−3.5 → −2.5) и обратный флип (+ → −) не считаются.
+    """
+    old = None
+    if isinstance(prev, (list, tuple)) and len(prev) >= 1:
+        old = _fora_float(prev[0])
+    new = _fora_float(ev.get("f1"))
+    return old is not None and new is not None and old < 0 < new
+
+
+def send_telegram(token, chat_id, text, timeout=15):
+    """Отправка сообщения в Telegram (sendMessage, HTML).
+
+    Возвращает (True, None) при успехе или (False, описание ошибки).
+    """
+    url = "https://api.telegram.org/bot{}/sendMessage".format(token)
+    payload = json.dumps({
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=payload,
+        headers={"Content-Type": "application/json",
+                 "User-Agent": "fora-monitor"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        if data.get("ok"):
+            return True, None
+        return False, "Telegram API: {}".format(
+            data.get("description", "неизвестная ошибка"))
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", "replace")[:200]
+        except Exception:  # noqa: BLE001 - тело ошибки не критично
+            pass
+        return False, "HTTP {}: {} {}".format(exc.code, exc.reason, body)
+    except Exception as err:  # noqa: BLE001 - сеть/таймаут
+        return False, str(err)
+
+
+def build_flip_message(flips, ts):
+    """Текст Telegram-сообщения о переходах форы «минус -> плюс» (HTML).
+
+    flips — список словарей {match, start, live, prev, cur}; ts — время
+    текущей проверки («25.11.2026 23:30:05»). Названия команд экранируются.
+    """
+    head = "🔄 Фора прошла через ноль (минус → плюс)"
+    if len(flips) > 1:
+        head += " — матчей: {}".format(len(flips))
+    blocks = []
+    for f in flips:
+        p, c = f["prev"], f["cur"]
+        prev_ts = p[4] if len(p) >= 5 and p[4] else None
+        was = "Было{}: [{} ({}) / {} ({})]".format(
+            " ({})".format(prev_ts[:16]) if prev_ts else "",
+            p[0] or "—", p[1] or "—", p[2] or "—", p[3] or "—")
+        became = "Стало ({} МСК): [{} ({}) / {} ({})]".format(
+            ts[:16], c[0] or "—", c[1] or "—", c[2] or "—", c[3] or "—")
+        blocks.append("\n".join([
+            "🏀 " + html.escape(f["match"] or "матч"),
+            "Начало: {}{}".format(
+                f["start"] or "—", " · LIVE" if f["live"] else " МСК"),
+            was,
+            became,
+        ]))
+    joiner = "\n\n────────────\n\n" if len(flips) > 1 else "\n\n"
+    return head + "\n\n" + joiner.join(blocks)
+
+
+def _tg_flip_logline(flip, ts):
+    """Строка журнала tg_log.txt по одному переходу."""
+    return "{} | {} | фора 1: {} → {}".format(
+        ts, flip["match"], flip["prev"][0] if flip["prev"] else "—",
+        flip["cur"][0] if flip["cur"] else "—")
+
+
+def append_tg_log(path, line):
+    """Строка в журнал отправок Telegram (data/tg_log.txt)."""
+    try:
+        if not os.path.exists(path):
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("# Журнал отправок Telegram: переходы форы «минус → плюс»\n")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError as err:
+        print("[!] не удалось записать tg_log.txt: {}".format(err), file=sys.stderr)
+
+
 def run_once(data_dir, url, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES,
              quiet=False, force=False):
     """Одна проверка. Возвращает словарь со сводкой запуска.
@@ -1285,6 +1407,15 @@ def run_once(data_dir, url, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES,
 
     prev_state = load_state(state_path)  # id -> [f1, k1, f2, k2]
 
+    # Telegram: уведомления «фора прошла через ноль (минус -> плюс)»;
+    # включаются секретами TG_TOKEN и TG_CHAT (на GitHub), без них — как раньше
+    tg_token = os.environ.get(TG_ENV_TOKEN, "").strip()
+    tg_chat = os.environ.get(TG_ENV_CHAT, "").strip()
+    tg_flips = []
+    tg_log_path = os.path.join(data_dir, "tg_log.txt")
+    pending = prev_state.get("tg_pending") \
+        if isinstance(prev_state.get("tg_pending"), dict) else {}
+
     stats = {"total": len(events), "new": 0, "changed": 0, "same": 0, "noline": 0}
 
     log_lines = ["=== {} МСК | матчей на странице: {} ===".format(ts, len(events))]
@@ -1313,6 +1444,12 @@ def run_once(data_dir, url, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES,
         if ev["f1"] is None and ev["f2"] is None:
             stats["noline"] += 1
 
+        if not ev["live"] and detect_minus_to_plus(prev, ev):
+            tg_flips.append({
+                "match": ev["match"], "start": ev["start"], "live": ev["live"],
+                "prev": list(prev) if isinstance(prev, (list, tuple)) else [],
+                "cur": [ev["f1"], ev["k1"], ev["f2"], ev["k2"]],
+            })
         live_tag = " [LIVE]" if ev["live"] else ""
         log_lines.append("{}{} | {}: {}".format(ev["start"], live_tag, ev["match"], detail))
 
@@ -1322,8 +1459,46 @@ def run_once(data_dir, url, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES,
             ev["f2"] or "", ev["k2"] or "",
             status,
         ])
-        # обновляем состояние
-        prev_state[ev["id"]] = list(cur)
+        # обновляем состояние (+ время проверки — для «Было (…)» в Telegram)
+        prev_state[ev["id"]] = list(cur) + [ts]
+
+    # Telegram: повтор неудачных отправок + новое сообщение о переходах
+    tg_sent = 0
+    if tg_flips or pending:
+        if pending:
+            for stamp in sorted(list(pending)):
+                ok, err = send_telegram(tg_token, tg_chat, pending[stamp]["text"])
+                if ok:
+                    for ln in pending[stamp]["loglines"]:
+                        append_tg_log(tg_log_path, ln + " | отправлено (повтор)")
+                    tg_sent += 1
+                    del pending[stamp]
+                else:
+                    print("[!] Telegram (повтор от {}): {}".format(stamp, err),
+                          file=sys.stderr)
+                    break  # сеть/API лежит — остальные тоже не пройдут
+        if tg_flips and tg_token and tg_chat:
+            text = build_flip_message(tg_flips, ts)
+            loglines = [_tg_flip_logline(f, ts) for f in tg_flips]
+            ok, err = send_telegram(tg_token, tg_chat, text)
+            if ok:
+                for ln in loglines:
+                    append_tg_log(tg_log_path, ln + " | отправлено")
+                tg_sent += 1
+            else:
+                pending[ts] = {"text": text, "loglines": loglines}
+                for ln in loglines:
+                    append_tg_log(tg_log_path, ln + " | ОШИБКА: {}".format(err))
+                print("[!] Telegram: {} — повторим при следующей проверке".format(err),
+                      file=sys.stderr)
+        elif tg_flips:
+            print("[!] Telegram не настроен (переменные окружения {} и {}): "
+                  "пропущено уведомление о {} переходе(ах) форы через ноль".format(
+                      TG_ENV_TOKEN, TG_ENV_CHAT, len(tg_flips)), file=sys.stderr)
+        if pending:
+            prev_state["tg_pending"] = pending
+        else:
+            prev_state.pop("tg_pending", None)
 
     # журнал log.txt: пересборка из history.csv со схлопыванием серий
     # «без изменений»; если пересборка не удалась — пишем сырой лог как раньше
@@ -1373,6 +1548,8 @@ def run_once(data_dir, url, timeout=DEFAULT_TIMEOUT, retries=DEFAULT_RETRIES,
                "без изменений {} (без линии {}).".format(
                    ts, stats["total"], stats["new"], stats["changed"],
                    stats["same"], stats["noline"]))
+    if tg_sent:
+        summary += " В Telegram отправлено: {}.".format(tg_sent)
     if not quiet:
         print(summary)
     return {"ok": True, "stats": stats, "summary": summary}
